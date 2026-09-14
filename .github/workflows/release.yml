@@ -102,6 +102,15 @@ jobs:
         $tag = "${{ github.event.inputs.tag || github.ref_name }}"
         if (-not $tag.StartsWith("v")) { $tag = "v" + $tag }
         $version = $tag.Substring(1)
+        if ($version -notmatch '^\d+(\.\d+){0,3}([a-z][a-z0-9]*)?$') {
+          # 分支推送（如 main）没有语义化版本号：Inno 的 VersionInfoVersion 只接受
+          # 数字版本（曾因 /DMyAppVersion=main 编译中止）。回退读 frontend/package.json
+          # 的版本号——与 build.py 给 EXE 内嵌的版本同源，产物名也可预测。
+          $pkg = Get-Content -LiteralPath "frontend/package.json" -Raw | ConvertFrom-Json
+          $version = [string]$pkg.version
+          $tag = "v$version"
+          Write-Host "非 tag 构建（ref=$env:GITHUB_REF_NAME）：回退使用 package.json 版本 $version"
+        }
 
         # 运行器镜像通常预装 Inno Setup 6；没有则回落 Chocolatey 安装。
         $isccCandidates = @(
@@ -150,6 +159,11 @@ jobs:
       run: |
         $tag = "${{ github.event.inputs.tag || github.ref_name }}"
         if (-not $tag.StartsWith("v")) { $tag = "v" + $tag }
+        if ($tag.Substring(1) -notmatch '^\d+(\.\d+){0,3}([a-z][a-z0-9]*)?$') {
+          $pkg = Get-Content -LiteralPath "frontend/package.json" -Raw | ConvertFrom-Json
+          $tag = "v$([string]$pkg.version)"
+          Write-Host "非 tag 构建（ref=$env:GITHUB_REF_NAME）：zip 命名回退 package.json 版本 $([string]$pkg.version)"
+        }
         Compress-Archive -Path backend/dist/KikoeruManager.exe, tools -DestinationPath "kikoerumanager-$tag-windows-console.zip" -Force
         Compress-Archive -Path backend/dist/KikoeruManager-noconsole.exe, tools -DestinationPath "kikoerumanager-$tag-windows-noconsole.zip" -Force
         Get-ChildItem *.zip
