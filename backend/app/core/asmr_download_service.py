@@ -112,8 +112,10 @@ class ASMRDownloadService:
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建 HTTP 会话。
 
-        trust_env=True：未显式配置 asmr_sync.http_proxy 时自动跟随环境变量 /
-        系统代理（含 Windows 系统代理），用户开启梯子（系统代理模式）即可生效。
+        trust_env=True：未显式配置 asmr_sync.http_proxy 时自动跟随环境变量
+        HTTP_PROXY/HTTPS_PROXY。注意：aiohttp trust_env 只读环境变量，不读
+        Windows 系统代理（WinINET 注册表）——双击启动的 GUI 进程通常没有这些
+        环境变量，此时仍为直连；走代理请显式配置 asmr_sync.http_proxy。
         """
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=30, connect=10)
