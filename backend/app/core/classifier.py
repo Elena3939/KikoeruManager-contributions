@@ -828,6 +828,13 @@ class SmartClassifier:
             if source_path:
                 folder_name = os.path.basename(source_path)
                 extracted_maker = self._extract_maker_from_folder_name(folder_name)
+                if extracted_maker and self._extracted_maker_is_title_prefix(extracted_maker, metadata):
+                    # 标题自带【KU100】类前缀时，提取结果只是标题的一部分
+                    logger.info(
+                        "[分类] 文件夹名提取结果疑似标题前缀，忽略: extracted=%s",
+                        extracted_maker,
+                    )
+                    extracted_maker = None
                 # 文件夹名已经是最终重命名结果时，优先使用 RJ 号前面的社团名。
                 if extracted_maker and metadata.get('rjcode') and str(metadata.get('rjcode')).upper() in folder_name.upper():
                     if extracted_maker != maker_name:
@@ -924,6 +931,20 @@ class SmartClassifier:
             path = path[:100]
         return path.strip()
     
+    # 平衡括号段匹配：【...】 与 [...] 各自成对，禁止混配。
+    # 旧正则 ^[【\[]([^\】\]]+)[】\]] 会把「[【KU100】标题]」从内层 】 处截断，
+    # 产出残缺的「【KU100」（带左括号、缺右括号）。
+    _BRACKET_SEGMENT_RE = re.compile(r'^(?:【([^】]+)】|\[([^\]]+)\])')
+
+    @classmethod
+    def _pop_bracket_segment(cls, text: str) -> tuple[Optional[str], int]:
+        """取开头的平衡括号段，返回 (内容, 消耗字符数)；无匹配返回 (None, 0)。"""
+        match = cls._BRACKET_SEGMENT_RE.match(text or '')
+        if not match:
+            return None, 0
+        value = (match.group(1) or match.group(2) or '').strip()
+        return (value or None), match.end()
+
     def _extract_maker_from_folder_name(self, folder_name: str) -> Optional[str]:
         """从文件夹名提取社团名
         
@@ -935,29 +956,40 @@ class SmartClassifier:
         Returns:
             社团名字符串，如果无法提取则返回 None
         """
-        # 匹配开头的方括号或中文方括号内容
-        # 格式：[社团名] 或 【社团名】
-        pattern = r'^[【\[]([^\】\]]+)[】\]]'
-        match = re.match(pattern, folder_name)
-        
-        if match:
-            maker_name = match.group(1)
-            # 排除 RJ 号（如果第一个方括号内是 RJ 号，则跳过）
-            if re.match(r'^[RVB]J\d+$', maker_name, re.IGNORECASE):
-                # 第一个方括号是 RJ 号，尝试匹配第二个方括号
-                remaining = folder_name[match.end():]
-                second_match = re.match(r'^[【\[]([^\】\]]+)[】\]]', remaining)
-                if second_match:
-                    potential_maker = second_match.group(1)
-                    # 再次检查是否是 RJ 号
-                    if not re.match(r'^[RVB]J\d+$', potential_maker, re.IGNORECASE):
-                        logger.debug(f"[分类] 从第二个方括号提取社团名: {potential_maker}")
-                        return potential_maker
-                return None
-            logger.debug(f"[分类] 从第一个方括号提取社团名: {maker_name}")
-            return maker_name
-        
-        return None
+        first, consumed = self._pop_bracket_segment(folder_name)
+        if not first:
+            return None
+        # 排除 RJ 号（如果第一个方括号内是 RJ 号，则尝试第二个方括号）
+        if re.match(r'^[RVB]J\d+$', first, re.IGNORECASE):
+            second, _ = self._pop_bracket_segment(folder_name[consumed:])
+            if second and not re.match(r'^[RVB]J\d+$', second, re.IGNORECASE):
+                logger.debug(f"[分类] 从第二个方括号提取社团名: {second}")
+                return second
+            return None
+        logger.debug(f"[分类] 从第一个方括号提取社团名: {first}")
+        return first
+
+    @staticmethod
+    def _extracted_maker_is_title_prefix(extracted: str, metadata: Dict) -> bool:
+        """提取值疑似作品标题的一部分（设备标签/标题前缀），不应作为社团名。
+
+        典型：DLsite 标题「【KU100】老师…」自带【KU100】前缀，从已重命名文件夹
+        「[RJ..][【KU100】老师…][社团]…」提取出的任何变体（「【KU100」「KU100」
+        「【KU100】老师…」）都只是标题前缀。
+        合法格式「【社团名】标题」中 DLsite 标题不含社团前缀，不会误杀；
+        即便误杀也只是回退到元数据社团名，方向永远安全。
+        """
+        title = str((metadata or {}).get('work_name') or (metadata or {}).get('title') or '').strip()
+        value = str(extracted or '').strip()
+        if not title or not value:
+            return False
+        inner = value.strip('【】[] ')
+        probes = {value}
+        if inner:
+            probes.add(inner)
+            probes.add(f'【{inner}】')
+            probes.add(f'[{inner}]')
+        return any(probe and title.startswith(probe) for probe in probes)
     
     def _move_with_rename(self, source: str, target_dir: str, progress_cb=None) -> str:
         """移动文件/文件夹，处理重名

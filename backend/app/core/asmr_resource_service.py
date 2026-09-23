@@ -2951,7 +2951,10 @@ class ASMRResourceService:
         config,
     ) -> str:
         try:
-            smart_target = classifier._apply_classification_rules(metadata, source_path, target_library)
+            # 该流程的文件夹名是本流程刚用模板渲染的（或 preserve 模式的作品名），
+            # 社团名以刚抓取的元数据为准，不从自产文件名二次提取，
+            # 避免「[RJ..][【KU100】标题][社团]…」被误解析出标题前缀当社团。
+            smart_target = classifier._apply_classification_rules(metadata, None, target_library)
             if not smart_target:
                 return ""
             base = str(
