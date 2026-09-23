@@ -2598,6 +2598,58 @@ class TaskEngine:
             db.close()
         return updated
 
+    def _rewrite_pending_conflict_existing_path(self, old_path: str, new_path: str) -> int:
+        """字幕文件夹移入 Finished 后，同步改写指向旧路径的 PENDING 问题作品记录。
+
+        ASMR 同步任务步骤6 会把 subtitle_folder 搬到 <parent>/Finished/，
+        而该目录常常正是某条 conflict 的 existing_path；不改写的话 existing_path
+        变成死路径，保留新版 / 合并预检全部 404（"目标路径不存在"），用户只能 SKIP。
+        只改 PENDING：PROCESSING 的记录路径已拷进在跑任务的 metadata，改 DB 救不了。
+        """
+        old_value = str(old_path or "").strip()
+        new_value = str(new_path or "").strip()
+        if not old_value or not new_value or old_value == new_value:
+            return 0
+
+        from ..models.database import ConflictWork, get_db
+
+        db = next(get_db())
+        updated = 0
+        try:
+            rows = (
+                db.query(ConflictWork)
+                .filter(
+                    ConflictWork.existing_path == old_value,
+                    ConflictWork.status.in_(["PENDING"]),
+                )
+                .all()
+            )
+            for row in rows:
+                row.existing_path = new_value
+                metadata = dict(row.new_metadata or {})
+                metadata["existing_path_moved_from"] = old_value
+                metadata["existing_path_moved_at"] = datetime.now().isoformat()
+                row.new_metadata = metadata
+                updated += 1
+            if updated:
+                db.commit()
+                logger.info(
+                    "问题作品 existing_path 已随字幕文件夹移入 Finished 修正: count=%s old=%s new=%s",
+                    updated,
+                    old_value,
+                    new_value,
+                )
+        except Exception:
+            db.rollback()
+            logger.warning(
+                "修正问题作品 existing_path 失败: old=%s new=%s",
+                old_value, new_value, exc_info=True,
+            )
+            return 0
+        finally:
+            db.close()
+        return updated
+
     def _rj_subtitle_remote_retry_delay_seconds(self, value: Any) -> Optional[float]:
         message = str(value or "")
         if "远程库存暂时退化" not in message and "已熔断" not in message:
@@ -6171,6 +6223,13 @@ class TaskEngine:
                     await asyncio.to_thread(shutil.move, subtitle_folder, dest_subtitle_path)
                     logger.info(f"[{rjcode}] 字幕文件夹已移动到: {dest_subtitle_path}")
                     task.task_metadata['subtitle_moved_to'] = dest_subtitle_path
+                    # 同步改写指向旧字幕目录的 PENDING 问题作品记录，
+                    # 否则保留新版/合并预检会对死路径报"目标路径不存在"。
+                    await asyncio.to_thread(
+                        self._rewrite_pending_conflict_existing_path,
+                        subtitle_folder,
+                        dest_subtitle_path,
+                    )
 
                 except Exception as move_error:
                     logger.warning(f"[{rjcode}] 移动字幕文件夹失败: {move_error}")
@@ -7570,6 +7629,12 @@ class TaskEngine:
                         pass
 
                 rj = r.get("rjcode", "")
+                if translated:
+                    # 双保险：拒答文案不能写进 ai_title，也不能被用作文件夹新名字
+                    from .ai_title_translation_service import _is_refusal_text
+                    if _is_refusal_text(translated):
+                        logger.warning("[AI标题] 拒答文案拦截，不写入 ai_title: rj=%s", rj)
+                        translated = ""
                 if translated:
                     try:
                         fdb = next(_get_db())

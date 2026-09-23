@@ -42,6 +42,29 @@ def _safe_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+_REFUSAL_PATTERNS = (
+    "抱歉，我无法", "抱歉，我不能", "对不起，我无法", "对不起，我不能",
+    "很抱歉，我无法", "很抱歉，我不能", "我无法协助", "我不能协助",
+    "无法协助翻译", "无法为您提供", "不能为您提供",
+    "i'm sorry, but i can't", "i am sorry, but i cannot",
+    "i cannot assist", "i can't assist", "i cannot help with",
+    "i can't help with", "i'm unable to assist", "sorry, i cannot",
+)
+
+
+def _is_refusal_text(text: str) -> bool:
+    """检测模型拒答文案（如"抱歉，我无法协助翻译这段内容"）。
+
+    拒答必须当失败处理：否则拒答文案会被当作翻译结果写入 work_metadata.ai_title
+    并被用作文件夹新名字，污染 DB 和磁盘，后续 API 重命名还会因目标名冲突
+    抛 WinError 5。限制长度上限，避免正常标题里碰巧含"我无法"被误杀。
+    """
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    if len(normalized) > 120:
+        return False
+    return any(pattern in normalized for pattern in _REFUSAL_PATTERNS)
 
 
 def _config_to_dict(config: Any) -> Dict[str, Any]:
@@ -334,6 +357,10 @@ class AITitleTranslationService:
                     raise ValueError("模型返回了不完整的 JSON（缺少结束括号），输出可能被截断")
                 else:
                     content = content.strip().strip('"').strip("'").strip("「").strip("」").strip()
+                if _is_refusal_text(content):
+                    # 模型拒答（如"抱歉，我无法协助翻译这段内容"）必须当失败处理，
+                    # 否则拒答文案会被写进 ai_title 并用作文件夹新名字。
+                    raise ValueError(f"模型拒答: {content[:80]}")
                 logger.info(
                     "[AI标题] %s 翻译成功: work_name=%s -> %s tokens=%s",
                     request_label,

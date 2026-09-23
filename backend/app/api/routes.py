@@ -8163,7 +8163,11 @@ async def resolve_conflict(conflict_id: str, action: dict):
                 if not confirmed:
                     raise HTTPException(status_code=400, detail="保留新版前必须先完成删除审查确认")
                 source_path = str(conflict.new_path or "").strip()
-                existing_path = str(conflict.existing_path or "").strip()
+                # existing_path 可能是字幕目录被搬进 Finished 后的死路径，先兜底找回
+                existing_path = str(
+                    service._resolve_conflict_existing_path(conflict)
+                    or str(conflict.existing_path or "").strip()
+                ).strip()
                 if not source_path:
                     raise HTTPException(status_code=400, detail="缺少待处理源路径")
                 if not existing_path:

@@ -502,6 +502,82 @@ class ConflictResolutionService:
         except Exception:
             logger.warning("修正 conflict.new_path 外层异常 conflict=%s", conflict_id, exc_info=True)
 
+    def _resolve_conflict_existing_path(self, conflict) -> str:
+        """existing_path 兜底找回：字幕扫描任务会把字幕目录搬进 Finished/，
+        历史冲突记录的 existing_path 因此成为死路径（保留新版预检 404 的根因）。
+
+        fallback 顺序（越靠前越精确）：
+          1. 原路径存在 → 直接用
+          2. {parent}/Finished/{basename}
+          3. {parent}/Finished/{rjcode}
+          4. {parent}/Finished/*{rjcode}* 模糊匹配
+        都不命中返回原 candidate，由上层按原逻辑报错。
+        """
+        candidate = str(getattr(conflict, "existing_path", "") or "").strip()
+        if not candidate:
+            return candidate
+        if os.path.exists(candidate):
+            return candidate
+        parent = os.path.dirname(candidate)
+        basename = os.path.basename(candidate)
+        if not parent or not basename:
+            return candidate
+        finished_dir = os.path.join(parent, "Finished")
+        # 2. Finished/{basename}
+        p1 = os.path.join(finished_dir, basename)
+        if os.path.exists(p1):
+            return p1
+        rjcode = str(getattr(conflict, "rjcode", "") or "").strip()
+        if rjcode:
+            # 3. Finished/{rjcode}
+            p2 = os.path.join(finished_dir, rjcode)
+            if os.path.exists(p2):
+                return p2
+            # 4. Finished/ 下含 rjcode 的子项模糊匹配
+            try:
+                if os.path.isdir(finished_dir):
+                    for entry in os.listdir(finished_dir):
+                        if rjcode in entry:
+                            p3 = os.path.join(finished_dir, entry)
+                            if os.path.exists(p3):
+                                return p3
+            except OSError:
+                pass
+        return candidate
+
+    def _maybe_persist_resolved_existing_path(
+        self, conflict_id: str, original_path: str, resolved_path: str,
+    ) -> None:
+        """与 _maybe_persist_resolved_new_path 对称：把兜底找回的 existing_path 写回 DB。"""
+        if not conflict_id or not resolved_path:
+            return
+        if resolved_path == original_path:
+            return
+        try:
+            from ..models.database import ConflictWork, get_db
+            db = next(get_db())
+            try:
+                row = db.query(ConflictWork).filter(ConflictWork.id == conflict_id).first()
+                if not row or str(row.existing_path or "") != original_path:
+                    return
+                row.existing_path = resolved_path
+                metadata = dict(row.new_metadata or {})
+                metadata["existing_path_recovered_from"] = original_path
+                metadata["existing_path_recovered_at"] = time.time()
+                row.new_metadata = metadata
+                db.commit()
+                logger.info(
+                    "问题作品 existing_path 已自动修正: conflict=%s old=%s -> new=%s",
+                    conflict_id, original_path, resolved_path,
+                )
+            except Exception:
+                db.rollback()
+                logger.warning("修正 conflict.existing_path 失败 conflict=%s", conflict_id, exc_info=True)
+            finally:
+                db.close()
+        except Exception:
+            logger.warning("修正 conflict.existing_path 外层异常 conflict=%s", conflict_id, exc_info=True)
+
     def _read_stats_cache(self, conflict, side_key: str, current_path: str) -> Optional[dict[str, Any]]:
         if not current_path:
             return None
@@ -572,8 +648,9 @@ class ConflictResolutionService:
 
     def describe_conflict(self, conflict, include_stats: bool = False) -> dict[str, Any]:
         metadata = dict(conflict.new_metadata or {})
+        # sync 版不写库，只解析：字幕任务搬走目录后 existing_path 可能是死路径
         existing_context = self.infer_library_context(
-            conflict.existing_path,
+            self._resolve_conflict_existing_path(conflict),
             preferred_library_id=metadata.get("existing_library_id"),
         )
         source_context = self.infer_library_context(
@@ -615,8 +692,16 @@ class ConflictResolutionService:
                 getattr(conflict, "id", ""), original_new_path, resolved_new_path,
             )
 
+        # 兜底找回 existing 路径：字幕任务会把字幕目录搬进 Finished/，
+        # 历史 conflict 的 existing_path 可能是死路径（保留新版预检 404 的根因）。
+        original_existing_path = str(getattr(conflict, "existing_path", "") or "").strip()
+        resolved_existing_path = self._resolve_conflict_existing_path(conflict)
+        if resolved_existing_path and resolved_existing_path != original_existing_path:
+            self._maybe_persist_resolved_existing_path(
+                getattr(conflict, "id", ""), original_existing_path, resolved_existing_path,
+            )
         existing_context = self.infer_library_context(
-            conflict.existing_path,
+            resolved_existing_path,
             preferred_library_id=metadata.get("existing_library_id"),
         )
         source_context = self.infer_library_context(
@@ -781,10 +866,27 @@ class ConflictResolutionService:
         description = await self.describe_conflict_async(conflict)
         existing = description["existing"]
         manager = get_library_manager()
-        if existing["library_id"]:
-            preview = await manager.delete(existing["library_id"], existing["path"], confirmed=False)
-        else:
-            preview = self._local_preview(existing["path"])
+        try:
+            if existing["library_id"]:
+                preview = await manager.delete(existing["library_id"], existing["path"], confirmed=False)
+            else:
+                preview = self._local_preview(existing["path"])
+        except FileNotFoundError:
+            # 旧目录已不存在（可能被手动删除/搬走）：没有可删除的目标，
+            # 保留新版将直接把新目录放置到原位置（safe_replace_directory
+            # 对不存在的 target 本来就是"直接放置"），返回"空"预览让流程可继续。
+            if existing.get("is_remote"):
+                raise
+            preview = {
+                "need_confirm": True,
+                "type": "folder",
+                "name": os.path.basename(str(existing.get("path") or "")),
+                "path": existing.get("path") or "",
+                "size": 0,
+                "file_count": 0,
+                "folder_count": 0,
+                "missing_target": True,
+            }
         preview["library_id"] = existing["library_id"]
         preview["library_type"] = existing["library_type"]
         preview["library_name"] = existing["library_name"]
