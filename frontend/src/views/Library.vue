@@ -7971,6 +7971,8 @@ onMounted(async () => {
 
   window.addEventListener('kikoerumanager:events:message', handleFolderCompletionRealtimeEvent)
 
+  window.addEventListener('kikoerumanager:events:message', handleAiTitleRealtimeEvent)
+
   window.addEventListener('resize', updateBaiduUploadTreeViewportHeight)
 
   nextTick(() => bindPathBreadcrumbResizeObserver())
@@ -8195,6 +8197,8 @@ onBeforeUnmount(() => {
   stopSubtitleRealtimeEvents()
 
   window.removeEventListener('kikoerumanager:events:message', handleFolderCompletionRealtimeEvent)
+
+  window.removeEventListener('kikoerumanager:events:message', handleAiTitleRealtimeEvent)
 
   window.removeEventListener('resize', updateBaiduUploadTreeViewportHeight)
 
@@ -23474,6 +23478,24 @@ function refreshCurrentLibraryAndStatsInBackground (messagePrefix = '操作已�
     ElMessage.warning(`${messagePrefix}，但刷新列表失败：` + (error?.response?.data?.detail || error?.message || '未知错误'))
   })
 
+}
+
+
+// AI 标题汉化任务到终态（成功/失败/取消）时强制刷新库存页面。
+// 失败路径没有磁盘变更、不触发索引 SSE，此前页面会停在陈旧状态：
+// 用户接着做 API 重命名会因前端状态与磁盘不一致报错（WinError 5 等）。
+function handleAiTitleRealtimeEvent (event) {
+  const payloads = normalizeTaskCenterRealtimePayloads(event?.detail || {})
+    .filter(payload => payload?.type === 'task_center_changed')
+  let shouldRefresh = false
+  for (const payload of payloads) {
+    if (String(payload?.domain || '') !== 'ai_title') continue
+    const status = String(payload?.status || '').trim()
+    if (['completed', 'failed', 'cancelled'].includes(status)) shouldRefresh = true
+  }
+  if (shouldRefresh) {
+    refreshCurrentLibraryAndStatsInBackground('AI 标题汉化已结束', { forceRefresh: true })
+  }
 }
 
 
