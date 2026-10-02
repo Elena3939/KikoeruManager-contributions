@@ -373,6 +373,7 @@ import AppPageHeader from '../components/common/AppPageHeader.vue'
 import AppDropdown from '../components/common/AppDropdown.vue'
 import SystemLogTerminal from '../components/common/SystemLogTerminal.vue'
 import deleteIconAnimation from '../assets/anime/Delete icon animation.lottie'
+import { parseModule } from './_logsModuleTag.js'
 
 const LOG_FLUSH_INTERVAL = 160
 const LOG_STREAM_RECONNECT_MS = 2500
@@ -436,10 +437,43 @@ const lastSearchScanMb = ref(0)
 const lastSearchStoppedEarly = ref(false)
 const streamDroppedCount = ref(0)
 
+// 「未分类」哨兵：module 解析为 null 的行不再被静默丢弃。
+// 实测旧实现下 32.6% 的行 module === null，勾选任一模块会整片消失。
+const UNCLASSIFIED_MODULE = '未分类'
+
+// 模块累积集合（F3）：下拉选项不再只依赖当前日志窗口。
+// 旧实现遍历 logs.value，而 logs.value 受 logLimit 限制 —— 刚打开页面时下拉为空，
+// 历史出现过的类别也可能因窗口淘汰而消失。这里在解析阶段累积，只增不减（软上限见下）。
+const seenModules = ref(new Set())
+const SEEN_MODULES_MAX = 200
+
+function recordSeenModules(parsedLines) {
+  if (!Array.isArray(parsedLines) || parsedLines.length === 0) return
+  let changed = false
+  const current = seenModules.value
+  for (const log of parsedLines) {
+    const key = log.module || UNCLASSIFIED_MODULE
+    if (key && !current.has(key)) {
+      current.add(key)
+      changed = true
+    }
+  }
+  if (!changed) return
+  // 软上限：真实类别通常几十个；超出说明混入了伪标签，截断防止下拉被撑爆。
+  if (current.size > SEEN_MODULES_MAX) {
+    const trimmed = new Set(Array.from(current).slice(0, SEEN_MODULES_MAX))
+    seenModules.value = trimmed
+    return
+  }
+  // Set 是可变对象，必须换引用才能触发 computed 重算
+  seenModules.value = new Set(current)
+}
+
 const availableModules = computed(() => {
-  const modules = new Set()
+  // 以累积集合为主，并上当前窗口（防止极端情况下累积被截断后丢项）
+  const modules = new Set(seenModules.value)
   for (const log of logs.value) {
-    if (log.module) modules.add(log.module)
+    modules.add(log.module || UNCLASSIFIED_MODULE)
   }
   return Array.from(modules).sort()
 })
@@ -468,7 +502,8 @@ const filteredLogs = computed(() => {
 
   logs.value.forEach((log, index) => {
     if (!lvlSet.has(log.level)) return false
-    if (moduleSet && !moduleSet.has(log.module)) return false
+    // null 映射到「未分类」哨兵，保证这类行可被单独筛选而不是整片丢弃
+    if (moduleSet && !moduleSet.has(log.module || UNCLASSIFIED_MODULE)) return false
     const taskProgress = parseTaskProgressLog(log, index, taskRjcodeById, taskArchiveLabelById)
     if (taskProgress) {
       if (taskProgress.timestampMs && !firstProgressMsByTask.has(taskProgress.taskId)) {
@@ -523,7 +558,7 @@ const hiddenProcessNoiseCount = computed(() => {
   let count = 0
   for (const log of logs.value) {
     if (!lvlSet.has(log.level)) continue
-    if (moduleSet && !moduleSet.has(log.module)) continue
+    if (moduleSet && !moduleSet.has(log.module || UNCLASSIFIED_MODULE)) continue
     if (parseTaskProgressLog(log, 0, taskRjcodeById, taskArchiveLabelById)) continue
     if (isProcessNoiseLog(log)) count += 1
   }
@@ -964,22 +999,10 @@ function clearSearchKeyword() {
   }
 }
 
-function parseModule(message, rawLine) {
-  const bracketMatch = rawLine.match(/\[([^\]]+)\]/)
-  if (bracketMatch) {
-    const tag = bracketMatch[1]
-    if (tag.includes('KikoeruManager') || tag.includes('CONFIG') || tag.includes('RENAME') || tag.includes('RJ字幕')) {
-      return tag
-    }
-  }
-  if (message.includes('扫描') || message.includes('库存')) return '扫描'
-  if (message.includes('解压') || message.includes('压缩')) return '解压'
-  if (message.includes('分类') || message.includes('规则')) return '分类'
-  if (message.includes('元数据') || message.includes('RJ')) return '元数据'
-  if (message.includes('密码')) return '密码'
-  if (message.includes('清理') || message.includes('删除')) return '清理'
-  return null
-}
+// ── 模块（功能类别）解析 ──────────────────────────────────────────────
+// 实现已抽到 ./_logsModuleTag.js（便于单测），此处仅做绑定。
+// 关键点：标签优先精确提取（跳过级别标记与伪标签）→ 关键词兜底。
+// 详见 _logsModuleTag.js 顶部注释与 FIX_PLAN_logs-filter-and-library-refresh.md §1.2.1。
 
 function trimMapByOldest(map, maxSize, trimCount) {
   if (map.size <= maxSize) return
@@ -1103,6 +1126,8 @@ function parseLogLines(lines, keyPrefix = '', fullLines = []) {
     }
     delete log.hasOwnTime
   }
+  // F3：累积出现过的功能类别，让下拉不再受当前窗口限制
+  recordSeenModules(parsedLines)
   return parsedLines
 }
 
