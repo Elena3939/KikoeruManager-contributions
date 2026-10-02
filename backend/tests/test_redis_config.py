@@ -887,9 +887,12 @@ def test_library_index_watcher_degrades_cleanly_when_inotify_limit_is_reached(mo
 
     class FakeManager:
         def list_libraries(self):
+            # watch=True 是场景前提：只有开启实时监视的库才会挂 observer，
+            # 也才可能撞上 inotify 容量上限。（此前这里缺 watch 键 → 门控直接
+            # skip 两个库、observer 从不 start，用例恒失败在 watcher_mode='watchdog'。）
             return [
-                {"id": "library-a", "type": "local", "root_path": str(first_root)},
-                {"id": "library-b", "type": "local", "root_path": str(second_root)},
+                {"id": "library-a", "type": "local", "root_path": str(first_root), "watch": True},
+                {"id": "library-b", "type": "local", "root_path": str(second_root), "watch": True},
             ]
 
     class FakeRedis:
@@ -942,6 +945,69 @@ def test_library_index_watcher_degrades_cleanly_when_inotify_limit_is_reached(mo
         assert len(observers) == 2
         assert all(observer.stopped for observer in observers)
         assert all(observer.joined for observer in observers)
+    finally:
+        driver.stop(timeout=0.5)
+
+
+def test_unwatched_local_library_still_joins_scrub_roots(monkeypatch, tmp_path):
+    """v2.6.48：未开启「监视此库存」的本地库也要登记 _roots（供轻量巡检），但不挂 observer。
+
+    背景：读路径改 A 方案（索引即事实源、浏览不再 readdir 全目录）后，
+    未登记 _roots 的库永远没有「被巡检补进索引」的机会 —— 外部直拷进来的文件
+    将永久不出现在列表里。这里锁定解耦后的语义：
+      - _roots（= scrubbed_libraries）含所有本地库（无论是否监视）；
+      - observed_libraries 只含真正挂了 observer 的库；
+      - 远程库两者都不进。
+    """
+    lib_root = tmp_path / "library-a"
+    lib_root.mkdir()
+    observers = []
+
+    class FakeManager:
+        def list_libraries(self):
+            return [
+                {"id": "watch-off", "type": "local", "root_path": str(lib_root), "watch": False},
+                {"id": "watch-on", "type": "local", "root_path": str(lib_root), "watch": True},
+                {"id": "remote", "type": "synology", "root_path": str(lib_root), "watch": True},
+            ]
+
+    class RecordingObserver:
+        def __init__(self):
+            observers.append(self)
+
+        def schedule(self, *_args, **_kwargs):
+            return None
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def join(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "app.core.library_manager.get_library_manager", lambda: FakeManager()
+    )
+    monkeypatch.setattr(watcher_module, "Observer", RecordingObserver)
+    monkeypatch.setattr(
+        watcher_module, "_InventoryEventHandler", lambda *_a, **_k: object()
+    )
+    monkeypatch.setattr(watcher_module, "_read_inotify_limits", lambda: {})
+    monkeypatch.setattr(
+        LibraryIndexWatcherDriver, "_restore_redis_dirty", lambda self, *a, **k: None
+    )
+
+    driver = LibraryIndexWatcherDriver()
+    try:
+        driver.start()
+        diagnostics = driver.diagnostics()
+
+        assert set(driver._roots) == {"watch-off", "watch-on"}      # 远程库不进
+        assert diagnostics["scrubbed_libraries"] == ["watch-off", "watch-on"]
+        assert diagnostics["observed_libraries"] == ["watch-on"]    # 只有开启监视的挂 observer
+        assert len(observers) == 1
     finally:
         driver.stop(timeout=0.5)
 

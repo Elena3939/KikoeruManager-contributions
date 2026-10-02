@@ -165,6 +165,10 @@ class LibraryIndexWatcherDriver:
         self._lock = threading.Lock()
         self._dirty: dict[str, dict[str, _DirtyPath]] = {}
         self._roots: dict[str, str] = {}
+        # v2.6.48：_roots = 参与「轻量巡检」的本地库（含未开启实时监视的）；
+        # _observed_libraries = 真正挂了 watchdog observer 的库。两者解耦，
+        # 否则 diagnostics.observed_libraries 会把未监视的库也报成"被监视"。
+        self._observed_libraries: set[str] = set()
         self._observers: list[Observer] = []
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -194,6 +198,7 @@ class LibraryIndexWatcherDriver:
         self._last_start_errno = None
         self._inotify_limits = _read_inotify_limits()
         self._roots.clear()
+        self._observed_libraries = set()
         manager = get_library_manager()
         observers: list[Observer] = []
         try:
@@ -201,17 +206,27 @@ class LibraryIndexWatcherDriver:
             for item in manager.list_libraries():
                 if str(item.get("type") or "") != "local":
                     continue
-                # 只有显式开启「监视此库存」的库存才挂实时 observer；默认不监视，
-                # 避免把所有大目录（含挂进库存工作台的 /input 下载目录）全部纳入
-                # 事件监听，文件量大时事件风暴会拖垮系统
-                if not bool(item.get("watch", False)):
-                    skipped_unwatched += 1
-                    continue
                 library_id = str(item.get("id") or "")
                 root_path = os.path.abspath(str(item.get("root_path") or item.get("path") or ""))
                 if not library_id or not os.path.isdir(root_path):
                     continue
+                # v2.6.48：**登记 _roots 与挂 observer 解耦**。
+                #
+                # 背景：读路径改为 A 方案（索引即事实源，浏览不再 readdir 全目录）后，
+                # 「索引里没有的东西」只能靠写路径或巡检补进来。原先未开启
+                # 「监视此库存」的库既不挂 observer、也不写 _roots，于是
+                # _scrub_once 巡检覆盖不到它 —— 外部直拷进来的文件将**永远**不出现
+                # 在列表里（需手动重建）。而 UI 的语义是"未监视库靠手动重建或业务
+                # 写入补齐"，代价太大。
+                #
+                # 现在：未监视的库也登记进 _roots，参与 300s 一次、每次 ≤200 目录/≤2s
+                # 的浅层巡检（根 + 一层，见 _scrub_once），但**不挂实时 observer**
+                # ——大目录事件风暴的风险与原来完全一致；外部变更的可见延迟从
+                # "永久" 降到 "≤1 个巡检周期"。
                 self._roots[library_id] = root_path
+                if not bool(item.get("watch", False)):
+                    skipped_unwatched += 1
+                    continue
                 self._restore_redis_dirty(library_id, root_path)
                 observer = Observer()
                 observer.schedule(
@@ -220,10 +235,16 @@ class LibraryIndexWatcherDriver:
                     recursive=True,
                 )
                 observers.append(observer)
+                # 先登记再 start（v2.6.48）：若 start 抛 inotify 容量错误，整个 for 会
+                # 跳进下方 except 并把 observers 丢弃；此时 diagnostics.observed_libraries
+                # 仍应报出「本应被实时监视」的这批库 —— 与降级分支的既有报语义保持一致
+                #（旧实现用 _roots 充当该字段，恰好等价）。
+                self._observed_libraries.add(library_id)
                 observer.start()
             if skipped_unwatched:
                 logger.info(
-                    "[索引 watcher] %s 个本地库存未开启「监视此库存」，默认不挂实时 observer",
+                    "[索引 watcher] %s 个本地库存未开启「监视此库存」：不挂实时 observer，"
+                    "仅参与 300s 轻量巡检（外部变更延迟最长 1 个巡检周期）",
                     skipped_unwatched,
                 )
         except Exception as exc:
@@ -252,10 +273,10 @@ class LibraryIndexWatcherDriver:
         )
         self._thread.start()
         logger.info(
-            "[索引 watcher] 已启动 mode=%s local_libraries=%s observed_libraries=%s roots=%s",
+            "[索引 watcher] 已启动 mode=%s scrubbed_libraries=%s observed_libraries=%s roots=%s",
             self._watcher_mode,
-            len(self._observers),
             len(self._roots),
+            len(self._observed_libraries),
             sorted(self._roots.keys()),
         )
 
@@ -663,7 +684,8 @@ class LibraryIndexWatcherDriver:
     def diagnostics(self) -> dict[str, object]:
         with self._lock:
             dirty = {library_id: len(paths) for library_id, paths in self._dirty.items()}
-            observed_libraries = sorted(self._roots)
+            observed_libraries = sorted(self._observed_libraries)
+            scrubbed_libraries = sorted(self._roots)
             recovery_running = sorted(self._generation_recovery_running)
             recovery_pending = sorted(self._generation_recovery_requested)
         return {
@@ -679,6 +701,7 @@ class LibraryIndexWatcherDriver:
             "start_errno": self._last_start_errno,
             "inotify_limits": dict(self._inotify_limits),
             "observed_libraries": observed_libraries,
+            "scrubbed_libraries": scrubbed_libraries,
             "dirty_paths": dirty,
             "overflow_count": self._overflow_count,
             "generation_recovery_count": self._generation_recovery_count,
