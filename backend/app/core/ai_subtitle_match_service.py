@@ -149,6 +149,191 @@ def _extract_litellm_stream_delta(chunk: Any) -> Tuple[str, Dict[str, int]]:
     }
 
 
+# 常见正文承载字段：优先按此顺序取“主文本”，都取不到再回退到任意非空文本字段。
+# 注意这里**不是** provider 特判——只是决定多个文本字段同时存在时谁当正文，
+# 任何未知字段名依然会被收集（见 _collect_text_fields）。
+_PRIMARY_TEXT_KEYS = ("content", "reasoning_content", "reasoning", "thinking", "text")
+
+# 这些 delta 字段承载的是「响应结构」而不是「模型输出内容」，不纳入文本收集。
+_NON_TEXT_DELTA_KEYS = (
+    "role",
+    "finish_reason",
+    "index",
+    "tool_calls",
+    "function_call",
+    "refusal",
+    "logprobs",
+    "audio",
+)
+
+
+def _normalize_content_value(value: Any) -> str:
+    """把 content 的各种形态（str / list[dict] / None）统一成字符串。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            str((part or {}).get("text") or (part or {}).get("content") or "")
+            if isinstance(part, dict)
+            else str(part or "")
+            for part in value
+        )
+    return str(value)
+
+
+def _merge_usage_fields(current: Dict[str, int], incoming: Dict[str, Any]) -> Dict[str, int]:
+    """按字段合并 usage，避免「后面 chunk 缺字段把前面已拿到的值整体覆盖掉」。
+
+    原实现是 ``usage = chunk_usage`` 整块覆盖：当服务端把 usage 拆在多个
+    chunk 里（或最后一个 chunk 只带部分字段）时，前面已解析出的 token
+    计数会凭空消失——这是「有输出 token 但日志显示 0」的证据丢失根因。
+    """
+    merged = dict(current or {})
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = _safe_int((incoming or {}).get(key))
+        if value:
+            merged[key] = value
+    merged.setdefault("prompt_tokens", 0)
+    merged.setdefault("completion_tokens", 0)
+    merged.setdefault("total_tokens", 0)
+    return merged
+
+
+def _collect_text_fields(container: Any) -> Dict[str, str]:
+    """把容器（dict 或对象）里所有「非空文本字段」原样收集成 {字段名: 文本}。
+
+    这是本模块「不硬编码字段名」的核心：不判断字段是否认识，只看值像不像
+    文本；认识的字段名不会因此有任何优先级（优先级只在选主文本时用）。
+    这样任何 provider 把正文放在任意字段（content / reasoning_content /
+    reasoning / thinking / text / 甚至 answer_text 之类的自定义名）都能被
+    取到并写进日志，无需为具体模型写特判。
+    """
+    if container is None:
+        return {}
+    if isinstance(container, dict):
+        items = container.items()
+    else:
+        raw = getattr(container, "__dict__", None)
+        if isinstance(raw, dict) and raw:
+            items = raw.items()
+        else:
+            # pydantic / litellm 模型对象：按已知字段名探测属性。
+            items = ((key, getattr(container, key, None)) for key in _PRIMARY_TEXT_KEYS)
+
+    collected: Dict[str, str] = {}
+    for key, value in items:
+        if not isinstance(key, str) or key.startswith("_") or key in _NON_TEXT_DELTA_KEYS:
+            continue
+        text = _normalize_content_value(value)
+        if text:
+            collected[key] = text
+    return collected
+
+
+def extract_litellm_stream_delta_verbose(
+    chunk: Any,
+) -> Tuple[str, Dict[str, str], Dict[str, int], str]:
+    """从流式分片提取内容，返回 ``(主文本, 全部文本字段, usage, finish_reason)``。
+
+    与 ``_extract_litellm_stream_delta`` 的区别是**不硬编码字段名**：
+
+    1. 先把 delta 里所有文本类字段原样收集（dict 直接取值，对象取属性）；
+    2. 再按 ``_PRIMARY_TEXT_KEYS`` 的优先级选一个作为「主文本」用于拼接；
+    3. 主文本全空时，回退到收集到的任意文本字段（保证推理模型正文放在
+       ``reasoning_content`` 时不会被判成空响应）；
+    4. ``finish_reason`` 从 choice 层读取；usage 按字段 merge。
+
+    设计为**无副作用纯函数**：标题翻译、AI 字幕配对、连接测试三处可共用同一
+    实现，诊断口径一致。
+    """
+    # ---- usage：按字段 merge，不整块覆盖 ----
+    usage_obj = chunk.get("usage") if isinstance(chunk, dict) else getattr(chunk, "usage", None)
+    if usage_obj is None:
+        raw_usage: Dict[str, Any] = {}
+    elif isinstance(usage_obj, dict):
+        raw_usage = usage_obj
+    else:
+        raw_usage = {
+            "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+            "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+            "total_tokens": getattr(usage_obj, "total_tokens", 0),
+        }
+    usage = {
+        "prompt_tokens": _safe_int(raw_usage.get("prompt_tokens")),
+        "completion_tokens": _safe_int(raw_usage.get("completion_tokens")),
+        "total_tokens": _safe_int(raw_usage.get("total_tokens")),
+    }
+
+    choices = chunk.get("choices") if isinstance(chunk, dict) else getattr(chunk, "choices", None)
+    if not choices:
+        return "", {}, usage, ""
+
+    choice = choices[0]
+    delta = choice.get("delta") if isinstance(choice, dict) else getattr(choice, "delta", None)
+    if choice is None or delta is None:
+        finish_reason = _safe_text(
+            choice.get("finish_reason") if isinstance(choice, dict)
+            else getattr(choice, "finish_reason", "")
+        )
+        return "", {}, usage, finish_reason
+
+    collected = _collect_text_fields(delta)
+
+    # ---- 选主文本：先按已知优先级，再回退到任意已收集文本 ----
+    primary = ""
+    for key in _PRIMARY_TEXT_KEYS:
+        if collected.get(key):
+            primary = collected[key]
+            break
+    if not primary and collected:
+        # 未知字段承载正文（如某 provider 自定义 answer_text）——同样要能取到。
+        primary = next(iter(collected.values()))
+
+    finish_reason = _safe_text(
+        choice.get("finish_reason") if isinstance(choice, dict)
+        else getattr(choice, "finish_reason", "")
+    )
+    return primary, collected, usage, finish_reason
+
+
+_PROBE_TEXT_PREVIEW_CHARS = 2000
+
+
+def summarize_collected_text_fields(collected: Dict[str, str]) -> Dict[str, int]:
+    """把 {字段名: 文本} 压成 {字段名: 长度}，用于紧凑日志行。"""
+    return {key: len(value) for key, value in (collected or {}).items()}
+
+
+def log_collected_text_fields(
+    prefix: str,
+    collected: Dict[str, str],
+    *,
+    label: str = "",
+    preview_chars: int = _PROBE_TEXT_PREVIEW_CHARS,
+) -> None:
+    """逐字段打印模型实际返回的原文（截断），供日志诊断「思考/正文」分别是什么。
+
+    日志量控制：每段原文最多 ``preview_chars`` 字符，完整长度在行首的长度分布里；
+    因此 12,304 token 的思考内容不会把日志刷爆，但一定看得出「有输出、只是字段不对」。
+    """
+    if not collected:
+        return
+    lengths = summarize_collected_text_fields(collected)
+    tag = f"{prefix} {label}".strip()
+    for key, text in collected.items():
+        role = "正文" if key in ("content", "text") else "思考/其他"
+        logger.info(
+            "%s 响应字段[%s]（%s 字符，%s）: %s",
+            tag,
+            key,
+            lengths.get(key, 0),
+            role,
+            text[:preview_chars],
+        )
+
+
 def _is_stream_unsupported_error(exc: Exception) -> bool:
     raw = str(exc or "").lower()
     if "stream" not in raw and "streaming" not in raw:
@@ -392,7 +577,9 @@ class AISubtitleMatchService:
                     logger.info("[AI字幕] %s 流式首包: first_chunk_ms=%s", request_label, first_chunk_ms)
                 content_parts.append(delta)
             if any(chunk_usage.values()):
-                usage = chunk_usage
+                # 按字段 merge：服务端可能把 usage 拆在多个 chunk 里，
+                # 整块覆盖会让前面已拿到的 token 计数凭空消失。
+                usage = _merge_usage_fields(usage, chunk_usage)
         if stats is not None:
             stats["saw_chunk"] = saw_chunk
         duration_ms = int((time.perf_counter() - started) * 1000)
