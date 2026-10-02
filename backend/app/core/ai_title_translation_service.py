@@ -102,8 +102,22 @@ def _extract_litellm_content(response: Any) -> Tuple[str, Dict[str, int]]:
     if isinstance(choice, dict):
         message = choice.get("message", {})
         content = message.get("content", "")
+        if not content:
+            # 推理模型正文为空时回退到 reasoning_content，避免误判为空响应
+            # （与 AI 字幕配对的同名函数口径一致）。
+            content = message.get("reasoning_content", "") or message.get("reasoning", "")
     else:
-        content = getattr(getattr(choice, "message", None), "content", "")
+        message = getattr(choice, "message", None)
+        content = getattr(message, "content", "") if message is not None else ""
+        if not content and message is not None:
+            content = getattr(message, "reasoning_content", "") or getattr(message, "reasoning", "")
+    if isinstance(content, list):
+        content = "".join(
+            str((part or {}).get("text") or (part or {}).get("content") or "")
+            if isinstance(part, dict)
+            else str(part or "")
+            for part in content
+        )
     return str(content or "").strip(), {
         "prompt_tokens": _safe_int(usage.get("prompt_tokens")),
         "completion_tokens": _safe_int(usage.get("completion_tokens")),
@@ -137,27 +151,218 @@ def _litellm_chunk_finish_reason(chunk: Any) -> str:
         return ""
 
 
-async def _consume_litellm_stream(stream: Any) -> Tuple[str, Dict[str, int], str]:
-    """消费 litellm 流式响应，返回 (文本, usage, finish_reason)。
+def _merge_stream_usage(current: Dict[str, int], incoming: Dict[str, Any]) -> Dict[str, int]:
+    """按字段合并 usage，避免后到的分片把已有 token 计数整体覆盖掉。
+
+    服务端可能只在部分分片返回 usage、且各分片字段不全；整块覆盖会让日志里
+    ``usage={}`` 或全 0，正好丢掉「模型确实输出了 12,304 token」这类关键证据。
+    """
+    merged = dict(current or {})
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        try:
+            value = int((incoming or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value:
+            merged[key] = value
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        merged.setdefault(key, 0)
+    return merged
+
+
+# 重试必然同样失败的「确定性」错误特征：认证、配置、响应结构本身有问题。
+# ⚠️ 严禁把「截断 / max_tokens」相关词加入这里——截断可通过调大上限或重试改善，
+# 且既有测试 test_truncation_retries_then_succeeds 锁定了「截断要重试」的语义。
+_NON_RETRYABLE_MARKERS = (
+    "missing_config",
+    "authentication",
+    "unauthorized",
+    "invalid_api_key",
+    "invalid api key",
+    "api key is invalid",
+    "insufficient",
+    "quota",
+    "model_not_found",
+    "model not found",
+    "无法解析或不完整",
+    "不完整的 json",
+    "没有可用翻译结果",
+    "模型拒答",
+)
+
+
+def _is_non_retryable_error(exc: Exception) -> bool:
+    """该错误是否属于「重试必然同样失败」的确定性错误。
+
+    减少确定性错误的白等（实测一次失败要空转 16 秒）。网络抖动 / 超时 /
+    限流仍然重试。
+    """
+    raw = str(exc or "").lower()
+    if not raw:
+        return False
+    return any(marker in raw for marker in _NON_RETRYABLE_MARKERS)
+
+
+def _collect_non_stream_text_fields(response: Any) -> Dict[str, str]:
+    """非流式响应里 choice.message 的全部文本字段（通用收集，同样不硬编码）。
+
+    与流式的 ``extract_litellm_stream_delta_verbose`` 口径一致：标题翻译、
+    字幕配对、连接测试三处共用同一实现，日志可互相印证。
+    """
+    from .ai_subtitle_match_service import _collect_text_fields
+
+    choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+    if not choices:
+        return {}
+    choice = choices[0]
+    message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+    return _collect_text_fields(message)
+
+
+def _log_non_stream_response_fields(
+    request_label: str, response: Any, collected: Dict[str, str]
+) -> None:
+    """非流式路径的响应字段诊断日志（与流式路径同格式）。"""
+    from .ai_subtitle_match_service import log_collected_text_fields
+
+    finish_reason = _extract_finish_reason(response)
+    logger.info(
+        "[AI标题] %s 非流式响应汇总: finish_reason=%s 字段长度=%s",
+        request_label,
+        finish_reason or "(无)",
+        {key: len(value) for key, value in (collected or {}).items()} or "{}",
+    )
+    log_collected_text_fields("[AI标题]", collected, label=request_label)
+    if not any(collected.get(key) for key in ("content", "text")) and collected:
+        logger.warning(
+            "[AI标题] %s 正文(content)为空，但模型实际返回了其他文本字段: %s",
+            request_label,
+            {key: len(value) for key, value in collected.items()},
+        )
+
+
+def _pick_fallback_text(collected: Dict[str, str]) -> Tuple[str, str]:
+    """正文为空时，从已收集字段里挑一个可用的文本作为翻译结果。
+
+    返回 ``(字段名, 文本)``；无可用字段返回 ``("", "")``。
+
+    挑选顺序：先 ``reasoning_content``（推理模型把正文写在思考字段时的典型位置），
+    再其余任意非空字段。**不做模型名判断**——任何 provider 任何字段名都适用。
+    """
+    if not collected:
+        return "", ""
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        text = (collected.get(key) or "").strip()
+        if text:
+            return key, text
+    # 其余字段按插入顺序取第一个非空（排除纯结构字段由收集阶段已过滤）。
+    for key, value in collected.items():
+        text = (value or "").strip()
+        if text:
+            return key, text
+    return "", ""
+
+
+def _describe_empty_response(
+    usage: Dict[str, int], finish_reason: str, collected: Dict[str, str]
+) -> str:
+    """正文为空时给出可诊断的失败原因（而不是笼统的「模型返回为空」）。
+
+    三种形态必须区分开，否则日志无法定位是「模型没输出」还是「字段没读到」：
+
+    1. 有其他文本字段 → 模型**有输出**，只是没落在 content 上（推理模型典型）；
+       此时**回退使用该字段**，等同成功，不再报错。
+    2. 无任何文本字段但 completion_tokens > 0 或 finish_reason 非空 →
+       服务端确实生成过内容，但本端未解析到任何字段（响应结构/字段名问题）。
+    3. 全 0 且 finish_reason 为空 → 真的没输出。
+    """
+    lengths = {key: len(value) for key, value in (collected or {}).items()}
+    completion_tokens = int((usage or {}).get("completion_tokens") or 0)
+    total_tokens = int((usage or {}).get("total_tokens") or 0)
+    if collected:
+        # 形态 1：有输出，交给调用方回退使用（不该走到这里，留作文案兜底）。
+        return (
+            f"模型未返回标准正文(content)，但返回了其他文本字段 {lengths}，"
+            f"（usage={usage}, finish_reason={finish_reason or '无'}）"
+        )
+    if completion_tokens > 0 or total_tokens > 0 or finish_reason:
+        return (
+            f"模型有输出（completion_tokens={completion_tokens}, "
+            f"total_tokens={total_tokens}, finish_reason={finish_reason or '无'}）"
+            f"但未解析到任何文本字段，可能是响应结构不受支持"
+        )
+    return (
+        f"模型返回为空（未收到任何内容，usage={usage}, "
+        f"finish_reason={finish_reason or '无'}）"
+    )
+
+
+async def _consume_litellm_stream(
+    stream: Any, *, request_label: str = ""
+) -> Tuple[str, Dict[str, int], str, Dict[str, str]]:
+    """消费 litellm 流式响应，返回 ``(文本, usage, finish_reason, 字段原文汇总)``。
 
     流式下 ``timeout`` 是「两次数据块之间的停滞超时」而不是总时长上限：慢速模型
     / 长响应不会再因为整体耗时超过 timeout 被误杀（这正是标题翻译超时失败的根因）。
+
+    第 4 个返回值是**诊断用**的字段汇总 ``{字段名: 完整原文}``：推理模型会把输出
+    全花在 ``reasoning_content`` 上导致 ``content`` 为空，只有拿到每个字段的真实
+    内容才能区分「模型有输出但字段不对」与「模型真的没输出」。这里用通用收集
+    （``extract_litellm_stream_delta_verbose``）而不是硬编码字段名，不为任何具体
+    模型写特判。
     """
-    from .ai_subtitle_match_service import _extract_litellm_stream_delta
+    from .ai_subtitle_match_service import (
+        extract_litellm_stream_delta_verbose,
+        log_collected_text_fields,
+        summarize_collected_text_fields,
+    )
 
     parts: List[str] = []
     usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     finish_reason = ""
+    chunk_count = 0
+    saw_any_fields = False
+    # 每个字段的原文按到达顺序累积；不同 chunk 的同名字段拼接。
+    accumulated: Dict[str, str] = {}
     async for chunk in stream:
-        delta, chunk_usage = _extract_litellm_stream_delta(chunk)
+        chunk_count += 1
+        delta, collected, chunk_usage, chunk_finish = extract_litellm_stream_delta_verbose(chunk)
+        if collected:
+            saw_any_fields = True
+            for key, text in collected.items():
+                accumulated[key] = accumulated.get(key, "") + text
         if delta:
             parts.append(delta)
-        if any(chunk_usage.values()):
-            usage = chunk_usage
-        reason = _litellm_chunk_finish_reason(chunk)
-        if reason:
-            finish_reason = reason
-    return "".join(parts), usage, finish_reason
+        usage = _merge_stream_usage(usage, chunk_usage)
+        if chunk_finish:
+            finish_reason = chunk_finish
+
+    content = "".join(parts)
+    if request_label:
+        lengths = summarize_collected_text_fields(accumulated)
+        logger.info(
+            "[AI标题] %s 流式响应汇总: chunks=%s finish_reason=%s usage=%s 字段长度=%s",
+            request_label,
+            chunk_count,
+            finish_reason or "(无)",
+            usage,
+            lengths or "{}",
+        )
+        log_collected_text_fields("[AI标题]", accumulated, label=request_label)
+        if not content and accumulated:
+            # 决定性诊断：模型有输出、只是没落在 content 字段上。
+            logger.warning(
+                "[AI标题] %s 正文(content)为空，但模型实际返回了其他文本字段: %s",
+                request_label,
+                lengths,
+            )
+        elif not content and not accumulated and saw_any_fields:
+            logger.warning(
+                "[AI标题] %s 收到 %s 个分片但所有文本字段均为空（模型确实未输出内容）",
+                request_label,
+                chunk_count,
+            )
+    return content, usage, finish_reason, accumulated
 
 
 def _is_azure_config(config: Dict[str, Any]) -> bool:
@@ -299,17 +504,22 @@ class AITitleTranslationService:
         last_error: Optional[Exception] = None
         for attempt in range(max_retries + 1):
             try:
+                # 本轮响应里模型「实际返回了哪些字段」——用于空正文时给出可诊断原因。
+                collected_fields: Dict[str, str] = {}
                 async with _temporary_proxy(config.get("proxy_url", "")):
                     try:
                         stream = await litellm.acompletion(**stream_kwargs)
                         if hasattr(stream, "__aiter__"):
-                            content, usage, finish_reason = await asyncio.wait_for(
-                                _consume_litellm_stream(stream), timeout=hard_timeout
+                            content, usage, finish_reason, collected_fields = await asyncio.wait_for(
+                                _consume_litellm_stream(stream, request_label=request_label),
+                                timeout=hard_timeout,
                             )
                         else:
                             # 服务端/代理忽略了 stream=True，直接返回完整响应：按非流式解析。
                             content, usage = _extract_litellm_content(stream)
                             finish_reason = _extract_finish_reason(stream)
+                            collected_fields = _collect_non_stream_text_fields(stream)
+                            _log_non_stream_response_fields(request_label, stream, collected_fields)
                     except (asyncio.TimeoutError, TimeoutError):
                         raise
                     except Exception as stream_exc:
@@ -326,8 +536,26 @@ class AITitleTranslationService:
                         )
                         content, usage = _extract_litellm_content(response)
                         finish_reason = _extract_finish_reason(response)
+                        collected_fields = _collect_non_stream_text_fields(response)
+                        _log_non_stream_response_fields(request_label, response, collected_fields)
+                if not content and collected_fields:
+                    # 模型有输出、但正文没落在 content 字段上（推理模型把思考写在
+                    # reasoning_content 是典型形态）。在**不改动原字段语义**的前提下
+                    # 回退使用已收集到的文本，避免「有输出却被判为空响应」。
+                    # ⚠️ 不走「推理模型特判」：任何非空文本字段都可回退，通用有效。
+                    fallback_key, fallback_text = _pick_fallback_text(collected_fields)
+                    if fallback_text:
+                        logger.warning(
+                            "[AI标题] %s 正文为空，回退使用字段[%s]（%s 字符）作为翻译结果",
+                            request_label,
+                            fallback_key,
+                            len(fallback_text),
+                        )
+                        content = fallback_text
+                        if not usage.get("completion_tokens") and not usage.get("total_tokens"):
+                            usage["completion_tokens"] = len(fallback_text)
                 if not content:
-                    raise ValueError("模型返回为空")
+                    raise ValueError(_describe_empty_response(usage, finish_reason, collected_fields))
                 if finish_reason == "length":
                     raise ValueError(
                         f"模型输出达到 max_tokens 上限（{kwargs.get('max_tokens')}）被截断，"
@@ -371,6 +599,12 @@ class AITitleTranslationService:
                 return content, usage
             except Exception as exc:
                 last_error = exc
+                if _is_non_retryable_error(exc):
+                    # 认证失败 / 配置缺失 / 响应结构错误：重试只会白等同样结果。
+                    logger.error(
+                        "[AI标题] %s 确定性错误，不再重试: %s", request_label, exc
+                    )
+                    break
                 if attempt < max_retries:
                     wait = 1.0 * (attempt + 1)
                     logger.warning(
@@ -501,9 +735,15 @@ class AITitleTranslationService:
             _extract_litellm_stream_delta,
             _is_stream_unsupported_error,
             _litellm_stream_chunk_seen,
+            extract_litellm_stream_delta_verbose,
+            log_collected_text_fields,
+            summarize_collected_text_fields,
         )
 
         saw_chunk_ref = {"seen": False}
+        # 连接测试同样需要诊断能力：否则「模型返回为空」在探测侧依旧是黑盒。
+        # 与标题翻译共用同一个 verbose 收集函数，保证两处日志口径一致。
+        probe_fields_ref: Dict[str, str] = {}
 
 
         async def _stream_probe() -> Tuple[str, Dict[str, int]]:
@@ -518,8 +758,12 @@ class AITitleTranslationService:
                 delta, chunk_usage = _extract_litellm_stream_delta(chunk)
                 if delta:
                     parts.append(delta)
-                if any(chunk_usage.values()):
-                    usage = chunk_usage
+                usage = _merge_stream_usage(usage, chunk_usage)
+                _had_delta, probe_collected, _probe_usage, _ = (
+                    extract_litellm_stream_delta_verbose(chunk)
+                )
+                for key, text in (probe_collected or {}).items():
+                    probe_fields_ref[key] = probe_fields_ref.get(key, "") + text
             return "".join(parts), usage
 
 
@@ -537,6 +781,23 @@ class AITitleTranslationService:
                     response = await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=hard_timeout)
                     content, usage = _extract_litellm_content(response)
             if not _safe_text(content):
+                # 诊断：模型到底返回了哪些字段（连接测试侧原来完全看不到）。
+                logger.info(
+                    "[AI标题] 连接测试响应汇总: saw_chunk=%s usage=%s 字段长度=%s",
+                    saw_chunk_ref["seen"],
+                    usage,
+                    summarize_collected_text_fields(probe_fields_ref) or "{}",
+                )
+                log_collected_text_fields("[AI标题]", probe_fields_ref, label="连接测试")
+                if not content:
+                    # 与翻译主链路同口径：正文为空但有其他文本字段时回退使用。
+                    _probe_key, _probe_text = _pick_fallback_text(probe_fields_ref)
+                    if _probe_text:
+                        logger.warning(
+                            "[AI标题] 连接测试正文为空，回退使用字段[%s]（%s 字符）",
+                            _probe_key,
+                            len(_probe_text),
+                        )
                 total_tokens = _safe_int((usage or {}).get("total_tokens"))
                 completion_tokens = _safe_int((usage or {}).get("completion_tokens"))
                 if saw_chunk_ref["seen"]:
