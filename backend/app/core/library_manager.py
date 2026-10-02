@@ -2346,6 +2346,17 @@ class LibraryManager:
             )
             if indexed_result is not None:
                 return indexed_result
+            # 诊断日志（v2.6.46）：走到这里说明索引快路径放弃，回落实时扫描。
+            # 与 _list_files_via_index 内部的 [库存读] 日志配对，用于定位
+            # 「前端刷新了但内容没跟上」到底是索引滞后、索引未就绪还是条目被判定失效。
+            logger.info(
+                "库存读[回退实时]: lib=%s path=%s page=%s page_size=%s force_refresh=%s reason=index_declined",
+                library.id,
+                effective_current_path,
+                page,
+                page_size,
+                bool(force_refresh),
+            )
             return await asyncio.to_thread(
                 self._list_local_files,
                 library,
@@ -4306,8 +4317,25 @@ class LibraryManager:
 
             normalized_sort_by = self._normalize_library_sort_by(sort_by)
             service = get_library_index_service()
+            # 诊断日志（v2.6.46）：每次库存读取的入口快照。
+            # 用途——把「前端说刷新了」与「后端这次到底走没走索引」对上号。
+            logger.info(
+                "库存读[入口]: lib=%s path=%s page=%s page_size=%s force_refresh=%s sort_by=%s",
+                library.id,
+                current_path,
+                page,
+                page_size,
+                bool(force_refresh),
+                normalized_sort_by,
+            )
             if not self._index_has_usable_snapshot(service, library.id):
                 if library.type == "local":
+                    logger.info(
+                        "库存读[回退实时]: lib=%s path=%s reason=no_usable_snapshot index_status=%s",
+                        library.id,
+                        current_path,
+                        self._index_status_name(service, library.id),
+                    )
                     return None
                 index_status = self._index_status_name(service, library.id)
                 logger.info(
@@ -4331,6 +4359,11 @@ class LibraryManager:
                 and hasattr(service, "has_library_entries")
                 and not service.has_library_entries(library.id)
             ):
+                logger.info(
+                    "库存读[回退实时]: lib=%s path=%s reason=no_library_entries",
+                    library.id,
+                    current_path,
+                )
                 return None
             offset = max(0, (int(page or 1) - 1) * int(page_size or 200))
             payload = service.list_children_page(
@@ -4375,6 +4408,20 @@ class LibraryManager:
                 if fs_name_set != index_name_set:
                     disk_only = fs_name_set - index_name_set
                     ghost_only = index_name_set - fs_name_set
+                    # 诊断日志（v2.6.46）：这是「前端刷新了但内容没跟上」最关键的一条——
+                    # 命中即说明索引快照与磁盘不一致，本次已回退实时扫描（响应是对的），
+                    # 但快照要靠 reconcile 追上。若同一目录反复出现本日志，
+                    # 说明 reconcile 没能收敛（见 §2.1.1 实测：同一目录 6 秒内连中 3 次）。
+                    logger.warning(
+                        "库存读[探测命中]: lib=%s path=%s disk_total=%s index_total=%s"
+                        " disk_only=%s ghost_only=%s → 回退实时扫描",
+                        library.id,
+                        current_path or parent_path,
+                        len(fs_name_set),
+                        len(index_name_set),
+                        len(disk_only),
+                        len(ghost_only),
+                    )
                     self._report_browse_mismatch_and_reconcile(
                         library,
                         current_path or parent_path,
@@ -4420,8 +4467,22 @@ class LibraryManager:
                 0,
                 int(payload.get("total") or len(files)) - max(0, raw_entry_count - len(entries)),
             )
+            # 诊断日志（v2.6.46）：把响应携带的索引水位一并打出，便于与前端
+            # 「索引视图滞后丢弃」现象对照（前端 isIndexViewResponseCurrent 比的就是这两个值）。
+            watermark = ""
+            try:
+                status = service.get_status(library.id)
+                if status is not None:
+                    watermark = (
+                        f" accepted={int(getattr(status, 'accepted_seq', 0) or 0)}"
+                        f" materialized={int(getattr(status, 'materialized_seq', 0) or 0)}"
+                        f" generation={getattr(status, 'active_generation', None)}"
+                    )
+            except Exception:
+                logger.debug("读取库存索引水位失败: lib=%s", library.id, exc_info=True)
             logger.info(
-                "库存浏览走索引: lib=%s path=%s page=%s page_size=%s total=%s returned=%s cursor=%s",
+                "库存浏览走索引: lib=%s path=%s page=%s page_size=%s total=%s returned=%s"
+                " cursor=%s force_refresh=%s stale_rows=%s%s",
                 library.id,
                 current_path,
                 page,
@@ -4429,6 +4490,9 @@ class LibraryManager:
                 indexed_total,
                 len(files),
                 bool(payload.get("next_page_cursor")),
+                bool(force_refresh),
+                len(stale_relative_paths),
+                watermark,
             )
             return self._build_browse_result_from_index(
                 library,
@@ -5581,6 +5645,20 @@ class LibraryManager:
             item.pop("_sort_time", None)
             item.pop("_stat_size", None)
             item.pop("_stat_mtime_ms", None)
+        # 诊断日志（v2.6.46）：实时扫描路径的结果计数。
+        # 与「库存浏览走索引」的 total 对照，可看出索引与磁盘的偏差来源。
+        logger.info(
+            "库存读[实时扫描]: lib=%s path=%s page=%s page_size=%s disk_total=%s returned=%s"
+            " force_refresh=%s index_repair_queued=%s",
+            library.id,
+            target_path,
+            page,
+            page_size,
+            total,
+            len(page_items),
+            bool(force_refresh),
+            len(repair_paths),
+        )
         return {
             "files": page_items,
             "page": page,

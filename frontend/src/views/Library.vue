@@ -5938,6 +5938,32 @@ onDeactivated(() => {
 // （数据可能略旧，但空列表不可用；tombstone 过滤仍会隐藏已删除项）
 let directoryStaleDropCount = 0
 
+// ── 库存读链路诊断日志（v2.6.46）────────────────────────────────────
+// 用途：把「前端说刷新了」与「后端这次走了哪条路 / 前端被哪个守卫拦掉」对上号，
+// 定位「前端页面刷新了但后端数据没跟上」。
+// 默认开启（用户是自部署，可直接开 DevTools 看）；需要静音时在控制台执行
+//   localStorage.setItem('kikoerumanager.library.debug', '0')
+const LIBRARY_DEBUG_LOG_KEY = 'kikoerumanager.library.debug'
+function libraryDebugEnabled () {
+  try {
+    return localStorage.getItem(LIBRARY_DEBUG_LOG_KEY) !== '0'
+  } catch (e) {
+    return true
+  }
+}
+function libDebug (...args) {
+  if (!libraryDebugEnabled()) return
+  console.info('[库存刷新]', ...args)
+}
+let libraryRefreshSeq = 0
+
+// 从响应里摘出索引水位，便于与后端「库存浏览走索引 … accepted=/materialized=/generation=」对照
+function describeIndexWatermark (data) {
+  const view = (data && (data.index_view || (Array.isArray(data.index_views) && data.index_views[0]))) || null
+  if (!view) return 'index_view=<缺失>'
+  return `rev=${view.view_revision ?? '?'} gen=${view.active_generation ?? '?'} mat=${view.materialized_seq ?? '?'}`
+}
+
 // 扁平化预审弹窗：先干跑列出「空目录删除」与「单链合并」两组清单，勾选后执行
 const flattenPreviewVisible = ref(false)
 const flattenPreviewLoading = ref(false)
@@ -9326,6 +9352,13 @@ async function refreshLibrary (options = {}) {
   const requestSortBy = String(sortBy.value || DEFAULT_SORT_BY)
   const requestSortOrder = String(sortOrder.value || DEFAULT_SORT_ORDER)
 
+  const refreshTag = `#${++libraryRefreshSeq}`
+  libDebug(
+    `${refreshTag} 发起: lib=${requestLibraryId} path=${requestPath} page=${requestPage}`
+    + ` size=${requestPageSize} sort=${requestSortBy}/${requestSortOrder}`
+    + ` force=${forceRefresh} silent=${silent} epoch=${requestEpoch}`,
+  )
+
   if (forceRefresh) resetLibraryPageCursorCache()
 
   const pageCursor = getLibraryPageCursorForRequest(forceRefresh)
@@ -9376,20 +9409,46 @@ async function refreshLibrary (options = {}) {
 
     })
 
-    if (!directoryRequestGate.isCurrent(directoryRequest)) return
-    if (libraryViewMode.value !== requestMode) return
-    if (String(selectedLibraryId.value) !== requestLibraryId || String(currentPath.value || '') !== requestPath) return
-    if (Number(currentPage.value || 1) !== requestPage || Number(pageSize.value || DEFAULT_PAGE_SIZE) !== requestPageSize) return
-    if (String(sortBy.value || DEFAULT_SORT_BY) !== requestSortBy || String(sortOrder.value || DEFAULT_SORT_ORDER) !== requestSortOrder) return
+    if (!directoryRequestGate.isCurrent(directoryRequest)) {
+      libDebug(`${refreshTag} 丢弃: reason=gate_not_current epoch=${requestEpoch}`)
+      return
+    }
+    if (libraryViewMode.value !== requestMode) {
+      libDebug(`${refreshTag} 丢弃: reason=mode_changed now=${libraryViewMode.value} was=${requestMode}`)
+      return
+    }
+    if (String(selectedLibraryId.value) !== requestLibraryId || String(currentPath.value || '') !== requestPath) {
+      libDebug(
+        `${refreshTag} 丢弃: reason=target_changed lib=${selectedLibraryId.value}/${requestLibraryId}`
+        + ` path=${currentPath.value}/${requestPath}`,
+      )
+      return
+    }
+    if (Number(currentPage.value || 1) !== requestPage || Number(pageSize.value || DEFAULT_PAGE_SIZE) !== requestPageSize) {
+      libDebug(
+        `${refreshTag} 丢弃: reason=paging_changed page=${currentPage.value}/${requestPage}`
+        + ` size=${pageSize.value}/${requestPageSize}`,
+      )
+      return
+    }
+    if (String(sortBy.value || DEFAULT_SORT_BY) !== requestSortBy || String(sortOrder.value || DEFAULT_SORT_ORDER) !== requestSortOrder) {
+      libDebug(`${refreshTag} 丢弃: reason=sort_changed`)
+      return
+    }
     if (!libraryIndexStateStore.isIndexViewResponseCurrent(data)) {
       // 索引物化滞后（revision 低于本地记录）时丢弃旧快照是正确的，
       // 但必须安排重试，否则列表会冻结在空状态直到用户手动刷新；
       // 连续丢弃超过 3 次则接受当前响应兜底（空列表不可用）
       directoryStaleDropCount += 1
+      libDebug(
+        `${refreshTag} 索引视图滞后丢弃: drop=${directoryStaleDropCount} ${describeIndexWatermark(data)}`
+        + ` rows=${(data.files || []).length}`,
+      )
       if (directoryStaleDropCount <= 3) {
         scheduleListPoll([], { index_refresh_pending: true })
         return
       }
+      libDebug(`${refreshTag} 连续丢弃达上限，兜底接受当前响应（数据可能略旧）`)
       directoryStaleDropCount = 0
     }
     directoryStaleDropCount = 0
@@ -9398,6 +9457,11 @@ async function refreshLibrary (options = {}) {
     files.value = applyRecentRenameRows(filterRowsByIndexTombstones(data.files || [], requestLibraryId))
 
     totalFiles.value = data.total || 0
+
+    libDebug(
+      `${refreshTag} 应用: rows=${files.value.length} total=${totalFiles.value}`
+      + ` ${describeIndexWatermark(data)}`,
+    )
 
     if (data.libraries?.length) libraries.value = data.libraries
     if (data.libraries?.length) libraryIndexStateStore.setLibraryRoots(data.libraries)
