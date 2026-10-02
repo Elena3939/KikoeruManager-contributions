@@ -189,3 +189,171 @@ def test_probe_falls_back_on_disk_only_entry(tmp_path, monkeypatch):
     _, disk_only, ghost_only = calls[0]
     assert disk_only == ["new-dir"]
     assert ghost_only == []
+
+
+# ---------------------------------------------------------------------------
+# v2.6.47：force_refresh 绕过 + 读路径精确修补 + 节流全局共享
+#
+# 背景（FIX_PLAN §3.2.1 实测）：点刷新时旧实现「进索引 → 18 条全判 stale →
+# 整子树 upsert（数万条写）→ materialized_seq 被拖后 → 探测读到该目录 0 行
+# → 又回退」，形成自激循环。以下四组用例锁定修复后的语义。
+# ---------------------------------------------------------------------------
+
+
+def _make_bypass_manager(monkeypatch):
+    """构造只启用绕过分支所需桩的 manager，记录实际调用的方法。"""
+    manager = _manager()
+    monkeypatch.setattr(
+        LibraryManager,
+        "_library_uses_inventory_index",
+        lambda self, library: True,
+    )
+    monkeypatch.setattr(
+        LibraryManager,
+        "_index_has_usable_snapshot",
+        lambda self, service, library_id: (_ for _ in ()).throw(
+            AssertionError("force_refresh 应绕过索引，不应查询快照可用性")
+        ),
+    )
+    return manager
+
+
+def test_force_refresh_bypasses_index_for_local(tmp_path, monkeypatch):
+    """F9b：本地上库 + force_refresh=True → 直接回退实时扫描，不查索引。"""
+    manager = _make_bypass_manager(monkeypatch)
+    library = SimpleNamespace(
+        id="lib1", name="测试库", type="local",
+        root_path=str(tmp_path), browse_root_path=None, synology=None,
+    )
+    result = manager._list_files_via_index(
+        library,
+        page=1,
+        page_size=200,
+        current_path=str(tmp_path),
+        browse_root=str(tmp_path),
+        parent_path="",
+        sort_by="size",
+        sort_order="desc",
+        force_refresh=True,
+    )
+    assert result is None  # 交由调用方落 _list_local_files
+
+
+def test_force_refresh_does_not_bypass_for_remote(tmp_path, monkeypatch):
+    """F9b 边界：远程库不受绕过影响，仍走原有索引路径。"""
+    from app.core import library_index as index_pkg
+
+    manager = _manager()
+    monkeypatch.setattr(
+        LibraryManager,
+        "_library_uses_inventory_index",
+        lambda self, library: True,
+    )
+    monkeypatch.setattr(
+        LibraryManager,
+        "_index_has_usable_snapshot",
+        lambda self, service, library_id: False,
+    )
+    monkeypatch.setattr(
+        LibraryManager,
+        "_index_status_name",
+        lambda self, service, library_id: "building",
+    )
+    monkeypatch.setattr(
+        LibraryManager,
+        "_build_index_pending_browse_result",
+        lambda self, library, **kwargs: {"pending": True},
+    )
+    monkeypatch.setattr(
+        index_pkg, "get_library_index_service", lambda: SimpleNamespace()
+    )
+    library = SimpleNamespace(
+        id="lib2", name="远程库", type="synology",
+        root_path=str(tmp_path), browse_root_path=None, synology=None,
+    )
+    result = manager._list_files_via_index(
+        library,
+        page=1,
+        page_size=200,
+        current_path=str(tmp_path),
+        browse_root=str(tmp_path),
+        parent_path="",
+        sort_by="size",
+        sort_order="desc",
+        force_refresh=True,
+    )
+    # 远程库未就绪走 pending，说明没有被 force_refresh 分支短路
+    assert result == {"pending": True}
+
+
+def test_read_repair_scope_exact_forces_exact_scope(tmp_path, monkeypatch):
+    """F12：读路径 stale 修补必须把 scope 钉成 exact，不得升级为 subtree。"""
+    manager = _manager()
+    captured = {}
+
+    def _fake_record(self, library, absolute_paths, *, kind, source, scopes_by_path=None):
+        captured["kind"] = kind
+        captured["source"] = source
+        captured["paths"] = list(absolute_paths)
+        captured["scopes"] = dict(scopes_by_path or {})
+        return True
+
+    monkeypatch.setattr(LibraryManager, "_record_index_reconcile_many", _fake_record)
+    monkeypatch.setattr(
+        LibraryManager,
+        "_normalize_index_abs_key",
+        lambda self, library, path: os.path.normcase(os.path.abspath(path)),
+    )
+    library = SimpleNamespace(id="lib1", name="测试库", type="local",
+                              root_path=str(tmp_path), browse_root_path=None, synology=None)
+    target = os.path.join(str(tmp_path), "RJ016xxxxx")
+    manager._enqueue_index_read_repair_scope_exact(library, [target])
+
+    assert captured["kind"] == "reconcile"
+    assert captured["source"] == "read_repair_exact"
+    assert captured["paths"] == [target]
+    # 关键断言：目录路径也必须显式 exact（旧实现会因 isdir 自动升级 subtree）
+    assert list(captured["scopes"].values()) == ["exact"]
+
+
+def test_read_repair_scope_exact_dedupes_within_window(tmp_path, monkeypatch):
+    """F12：5 秒窗口内的同一路径不重复入队（沿用既有去重语义）。"""
+    manager = _manager()
+    calls = []
+
+    def _fake_record(self, library, absolute_paths, *, kind, source, scopes_by_path=None):
+        calls.append(list(absolute_paths))
+        return True
+
+    monkeypatch.setattr(LibraryManager, "_record_index_reconcile_many", _fake_record)
+    monkeypatch.setattr(
+        LibraryManager,
+        "_normalize_index_abs_key",
+        lambda self, library, path: os.path.normcase(os.path.abspath(path)),
+    )
+    library = SimpleNamespace(id="lib1", name="测试库", type="local",
+                              root_path=str(tmp_path), browse_root_path=None, synology=None)
+    target = os.path.join(str(tmp_path), "RJ016xxxxx")
+    manager._enqueue_index_read_repair_scope_exact(library, [target])
+    manager._enqueue_index_read_repair_scope_exact(library, [target])
+    assert len(calls) == 1
+
+
+def test_reconcile_throttle_is_shared_across_entrypoints(tmp_path, monkeypatch):
+    """F13：两个不同入口共用同一节流窗口，第二次必须被拦下。"""
+    manager = _manager()
+    library = SimpleNamespace(id="lib1", name="测试库", type="local")
+    # 模拟「完整性探测」与「名字级 diff」两个入口先后到达同一目录
+    assert manager._reconcile_throttle_allows(library, "/library/汉化") is True
+    assert manager._reconcile_throttle_allows(library, "/library/汉化") is False
+    # 不同目录不受影响
+    assert manager._reconcile_throttle_allows(library, "/library/其他") is True
+
+
+def test_reconcile_throttle_scopes_per_library(tmp_path, monkeypatch):
+    """F13：节流键包含库 id，不同库的同名目录互不干扰。"""
+    manager = _manager()
+    lib_a = SimpleNamespace(id="libA", name="A", type="local")
+    lib_b = SimpleNamespace(id="libB", name="B", type="local")
+    assert manager._reconcile_throttle_allows(lib_a, "/library/汉化") is True
+    assert manager._reconcile_throttle_allows(lib_b, "/library/汉化") is True

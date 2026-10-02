@@ -4121,8 +4121,78 @@ class LibraryManager:
         if missing_paths:
             self._notify_index_self_mutation_delete_batch(library, missing_paths)
         if stale_paths:
-            self._enqueue_index_read_repair_upserts(library, stale_paths)
+            # F12（v2.6.47）：读路径 stale 修补改用精确 scope，避免把「条目级差异」
+            # 放大成整棵子树写入（实测 18 条差异 → 数万条写）。
+            self._enqueue_index_read_repair_scope_exact(library, stale_paths)
         return (valid_entries, stale_relative_paths) if return_stale_paths else valid_entries
+
+    def _enqueue_index_read_repair_scope_exact(
+        self,
+        library: LibraryDefinition,
+        absolute_paths: list[str],
+    ) -> None:
+        """读路径 stale 修补的**本目录/精确**版本（F12，v2.6.47）。
+
+        与 `_enqueue_index_read_repair_upserts` 的唯一区别：把每条路径的 scope 钉死成
+        `exact`，不再让 `_record_index_reconcile_many` 按 `os.path.isdir` 自动升级成
+        `subtree`。
+
+        背景：读路径发现的 stale 条目**本身已经是具体条目**（entry 级），它们的
+        absolute_path 指向目录时（如 `/汉化/RJ016xxxxx`），旧的 `_enqueue_index_upsert_subtree_many`
+        会把它当子树处理 —— 实测 `/汉化` 下单个 RJ 子树有 12427~20545 个文件，
+        于是「18 条 stale」变成「数万条子树写入」，写放大把 materialized_seq 拖后，
+        探测随即读到该目录可见行为 0，形成自激循环（见 FIX_PLAN §3.2.1）。
+
+        这里保持「重取被判定 stale 的那批条目」语义不变，只是不再向下递归展开子树：
+        目录自身的元数据/直接子项索引由既有 reconcile 流程负责，读路径不该触发大规模写。
+        """
+        paths = [str(path or "").strip() for path in absolute_paths or [] if str(path or "").strip()]
+        if not paths:
+            return
+        if not hasattr(self, "_index_read_repair_lock"):
+            self._index_read_repair_lock = threading.Lock()
+        if not hasattr(self, "_index_read_repair_last_seen"):
+            self._index_read_repair_last_seen = {}
+        now = time.monotonic()
+        selected: list[str] = []
+        with self._index_read_repair_lock:
+            for path in paths:
+                key = f"{library.id}\0{self._normalize_index_abs_key(library, path)}"
+                if not key.strip("\0"):
+                    continue
+                last_seen = float(self._index_read_repair_last_seen.get(key) or 0)
+                if now - last_seen < 5.0:
+                    continue
+                self._index_read_repair_last_seen[key] = now
+                selected.append(path)
+            if len(self._index_read_repair_last_seen) > 4096:
+                cutoff = now - 60.0
+                self._index_read_repair_last_seen = {
+                    key: value
+                    for key, value in self._index_read_repair_last_seen.items()
+                    if value >= cutoff
+                }
+        if not selected:
+            return
+        scopes_by_path = {
+            os.path.normcase(os.path.abspath(path)): "exact"
+            for path in selected
+        }
+        try:
+            self._record_index_reconcile_many(
+                library,
+                selected,
+                kind="reconcile",
+                source="read_repair_exact",
+                scopes_by_path=scopes_by_path,
+            )
+        except Exception:
+            logger.debug(
+                "[索引] 读路径精确修补入队失败 library=%s count=%s",
+                library.id,
+                len(selected),
+                exc_info=True,
+            )
 
     def _enqueue_index_read_repair_upserts(
         self,
@@ -4312,6 +4382,20 @@ class LibraryManager:
     ) -> Optional[dict[str, Any]]:
         if not self._library_uses_inventory_index(library):
             return None
+        # F9b（v2.6.47）：显式「刷新」语义直接绕过索引快路径。
+        #
+        # force_refresh=True 来自用户的刷新动作，语义就是「我要看磁盘现在的样子」。
+        # 旧行为是照样进索引、发现不一致再回退实时扫描——响应对，但白跑一趟索引查询
+        # 且途中会触发写入（见下方 F9a 注释），反而放大延迟与写压力。
+        # 现在本地上库直接回退实时扫描，由调用方落 _list_local_files（结果同样正确、
+        # 且顺带入队索引修补），不再「进索引→探测→回退」兜一圈。
+        if force_refresh and library.type == "local":
+            logger.info(
+                "库存读[回退实时]: lib=%s path=%s reason=force_refresh_bypass",
+                library.id,
+                current_path,
+            )
+            return None
         try:
             from .library_index import get_library_index_service
 
@@ -4430,18 +4514,23 @@ class LibraryManager:
                     )
                     return None
             if force_refresh and library.type == "local":
-                refresh_paths = [
-                    str(getattr(entry, "absolute_path", "") or "")
-                    for entry in entries
-                    if str(getattr(entry, "absolute_path", "") or "")
-                ]
-                if refresh_paths:
-                    self._enqueue_index_read_repair_upserts(library, refresh_paths)
-                    stale_relative_paths.update({
-                        str(getattr(entry, "relative_path", "") or "")
+                # stale 行（若上面 _validate_local_index_entries_for_read 已判定）由那一处
+                # 统一入队补齐，这里**不再重复入队**同一批 entry。
+                #
+                # 背景（v2.6.47）：本分支此前会无条件把当前页所有 entry 再入队一次
+                # _enqueue_index_read_repair_upserts，而 :4124 已对 stale 行入队过，
+                # 于是「点一次刷新」触发两批子树 upsert（实测 /汉化 目录 18 条差异
+                # 触发数万条子树写入），写放大直接把索引 materialized_seq 拖后，
+                # 探测随即读到该目录可见行数为 0，形成「刷新→写→读空→再回退」的自激循环。
+                # 现在只保留「确实被判为 stale」行的补写，且只标记这些行为待刷新。
+                if stale_relative_paths:
+                    refresh_paths = [
+                        str(getattr(entry, "absolute_path", "") or "")
                         for entry in entries
-                        if str(getattr(entry, "relative_path", "") or "")
-                    })
+                        if str(getattr(entry, "relative_path", "") or "") in stale_relative_paths
+                    ]
+                    if refresh_paths:
+                        self._enqueue_index_read_repair_scope_exact(library, refresh_paths)
             files = []
             for index, entry in enumerate(entries):
                 if self._should_skip_entry(getattr(entry, "name", "")):
@@ -4514,6 +4603,37 @@ class LibraryManager:
             )
             return None
 
+    _RECONCILE_THROTTLE_SECONDS = 60.0
+
+    def _reconcile_throttle_allows(self, library: LibraryDefinition, dir_path: str) -> bool:
+        """按「库 + 目录」全局共享的去重节流（F13，v2.6.47）。
+
+        背景：探测/回退有多个入口（`no_usable_snapshot`、名字级 diff 命中、
+        `_list_local_files` 等），此前各自维护**独立**的 60 秒节流字典
+        （`_browse_completeness_reconcile_at` / `_browse_mismatch_reconcile_at`），
+        彼此看不见 → 同一目录在几秒内被不同入口各放行一次，反复入队 reconcile。
+        实测同一目录 6 秒内连中 3 次、13 份日志累计 39 次探测命中。
+
+        现在合并为单一字典，任一入口刚入过队，其他入口在窗口内一律跳过。
+        """
+        cache = getattr(self, "_index_reconcile_throttle_at", None)
+        if cache is None:
+            cache = {}
+            self._index_reconcile_throttle_at = cache
+        now = time.monotonic()
+        key = (str(library.id), str(dir_path))
+        last = cache.get(key)
+        if last is not None and now - last < self._RECONCILE_THROTTLE_SECONDS:
+            return False
+        cache[key] = now
+        # 防无界增长：超过阈值时清掉窗口外的旧键。
+        if len(cache) > 4096:
+            cutoff = now - self._RECONCILE_THROTTLE_SECONDS
+            self._index_reconcile_throttle_at = {
+                k: v for k, v in cache.items() if v >= cutoff
+            }
+        return True
+
     def _report_incomplete_dir_and_reconcile(
         self,
         library: LibraryDefinition,
@@ -4544,16 +4664,8 @@ class LibraryManager:
             fs_total,
             watermark,
         )
-        cache = getattr(self, "_browse_completeness_reconcile_at", None)
-        if cache is None:
-            cache = {}
-            self._browse_completeness_reconcile_at = cache
-        now = time.monotonic()
-        key = (str(library.id), str(dir_path))
-        last = cache.get(key)
-        if last is not None and now - last < 60.0:
+        if not self._reconcile_throttle_allows(library, dir_path):
             return
-        cache[key] = now
         try:
             self._record_index_reconcile_by_path(library, dir_path, source="browse_completeness")
         except Exception:
@@ -4590,16 +4702,8 @@ class LibraryManager:
             len(ghost_only),
             ghost_preview,
         )
-        cache = getattr(self, "_browse_mismatch_reconcile_at", None)
-        if cache is None:
-            cache = {}
-            self._browse_mismatch_reconcile_at = cache
-        now = time.monotonic()
-        key = (str(library.id), str(dir_path))
-        last = cache.get(key)
-        if last is not None and now - last < 60.0:
+        if not self._reconcile_throttle_allows(library, dir_path):
             return
-        cache[key] = now
         try:
             self._record_index_reconcile_by_path(library, dir_path, source="browse_name_diff")
         except Exception:
