@@ -4093,8 +4093,25 @@ class LibraryManager:
         entries: list[Any],
         *,
         return_stale_paths: bool = False,
+        diagnostics: Optional[dict[str, Any]] = None,
     ):
+        """对索引条目逐条 os.stat 校验（一层，不递归）。
+
+        ``diagnostics``（v2.6.48，**新增可选关键字出参**）：传入 dict 时回填本次校验
+        结果（``missing_paths`` / ``stale_paths`` / ``valid_count``）。用途是让调用方
+        拿到「索引里有、磁盘上已不存在」的**幽灵**条目——A 方案下这是浏览热路径唯一
+        允许触发实时扫描回退的信号。
+
+        刻意用「新增可选出参」而不是改返回值元数：本函数是 CRITICAL 级共享符号
+        （5 个调用方：_list_files_via_index / _folder_contents_via_index×3 /
+        folder_size_summary_via_index / _delete_preview_via_index /
+        _filter_delete_preview_via_index），改元数会打断全部调用方。
+        """
         if library.type != "local" or not entries:
+            if diagnostics is not None:
+                diagnostics["missing_paths"] = []
+                diagnostics["stale_paths"] = []
+                diagnostics["valid_count"] = len(entries)
             return (entries, set()) if return_stale_paths else entries
         valid_entries: list[Any] = []
         missing_paths: list[str] = []
@@ -4117,6 +4134,11 @@ class LibraryManager:
                 stale_paths.append(path)
                 stale_relative_paths.add(str(getattr(entry, "relative_path", "") or ""))
             valid_entries.append(entry)
+
+        if diagnostics is not None:
+            diagnostics["missing_paths"] = list(missing_paths)
+            diagnostics["stale_paths"] = list(stale_paths)
+            diagnostics["valid_count"] = len(valid_entries)
 
         if missing_paths:
             self._notify_index_self_mutation_delete_batch(library, missing_paths)
@@ -4464,53 +4486,54 @@ class LibraryManager:
             raw_entry_count = len(entries)
             stale_relative_paths: set[str] = set()
             if library.type == "local":
+                # ── A 方案（v2.6.48）：索引即事实源，浏览热路径不再 readdir 全目录 ──
+                #
+                # 历史：v2.6.41 为修「进目录显示旧名」引入**名字级 diff**（readdir 全目录
+                # 与索引条目名对比）。但分页上线后这个对比口径就错了——entries 是
+                # `limit=page_size` 的**本页**（默认 200/前端 100），fs_names 是
+                # `os.listdir` 的**全量**，于是任何子项数 > page_size 的目录 100% 误判
+                # 「磁盘多出 page_size 条」（实测 disk_only=191=291-100），恒回退实时扫描：
+                # 索引快路径等于被废掉，每页都白读一次全目录 + 每 60s 入队一次 reconcile。
+                #
+                # 现在：回退信号只取**幽灵**（索引里有、磁盘上已不存在）——
+                #   ① 删除/重命名旧侧/移动 都会产生幽灵 → v2.6.41 的原始动机仍被覆盖；
+                #   ② 「磁盘新增」方向不再触发回退（新增经软件 mutation 即时入索引；
+                #      外部直拷由 watcher 巡检兜底，见 watcher_driver._scrub_once）。
+                # 成本从 O(目录子项数) 的 readdir 降到 O(本页条数) 的 stat（本来就做）。
+                diagnostics: dict[str, Any] = {}
                 entries, stale_relative_paths = self._validate_local_index_entries_for_read(
                     library,
                     entries,
                     return_stale_paths=True,
+                    diagnostics=diagnostics,
                 )
-                # 完整性探测（v2.6.41）：磁盘名字级 diff 替代旧的计数比较。
-                # 旧逻辑 len(fs_names) > index_total 对「重命名/移动」（-1+1 计数守恒）
-                # 永远不触发——用户实测进入目录显示旧名，等 2s 轮询自纠。
-                # 现在：任何一侧多出的名字（磁盘新条目 / 快照幽灵）都回退文件系统扫描
-                # 保证本次显示正确，并入队子树 reconcile 修复快照。
-                # （一层 readdir，无递归；分页浏览下对比的仍是目录全量子项）
-                fs_names: list[str] = []
-                try:
-                    fs_names = [
-                        n for n in os.listdir(current_path or parent_path)
-                        if not self._should_skip_entry(n)
-                    ]
-                except OSError:
-                    fs_names = []
-                fs_name_set = set(fs_names)
-                index_name_set = {
-                    str(getattr(entry, "name", "") or "")
-                    for entry in entries
-                    if str(getattr(entry, "name", "") or "")
-                }
-                if fs_name_set != index_name_set:
-                    disk_only = fs_name_set - index_name_set
-                    ghost_only = index_name_set - fs_name_set
-                    # 诊断日志（v2.6.46）：这是「前端刷新了但内容没跟上」最关键的一条——
-                    # 命中即说明索引快照与磁盘不一致，本次已回退实时扫描（响应是对的），
+                ghost_paths = list(diagnostics.get("missing_paths") or [])
+                if ghost_paths:
+                    ghost_names = sorted({
+                        os.path.basename(str(path).rstrip("/\\"))
+                        for path in ghost_paths
+                        if str(path).strip()
+                    })
+                    # 诊断日志（v2.6.46 起）：这是「前端刷新了但内容没跟上」最关键的一条——
+                    # 命中即说明索引快照与磁盘真的不一致，本次已回退实时扫描（响应是对的），
                     # 但快照要靠 reconcile 追上。若同一目录反复出现本日志，
-                    # 说明 reconcile 没能收敛（见 §2.1.1 实测：同一目录 6 秒内连中 3 次）。
+                    # 说明 reconcile 没能收敛（见 FIX_PLAN §2.1.1：同一目录 6 秒内连中 3 次）。
                     logger.warning(
-                        "库存读[探测命中]: lib=%s path=%s disk_total=%s index_total=%s"
-                        " disk_only=%s ghost_only=%s → 回退实时扫描",
+                        "库存读[探测命中]: lib=%s path=%s page=%s page_size=%s"
+                        " index_page=%s index_declared_total=%s ghost_only=%s → 回退实时扫描",
                         library.id,
                         current_path or parent_path,
-                        len(fs_name_set),
-                        len(index_name_set),
-                        len(disk_only),
-                        len(ghost_only),
+                        page,
+                        page_size,
+                        raw_entry_count,
+                        payload.get("total"),
+                        len(ghost_names),
                     )
                     self._report_browse_mismatch_and_reconcile(
                         library,
                         current_path or parent_path,
-                        disk_only=sorted(disk_only),
-                        ghost_only=sorted(ghost_only),
+                        disk_only=[],
+                        ghost_only=ghost_names,
                     )
                     return None
             if force_refresh and library.type == "local":
@@ -4684,16 +4707,22 @@ class LibraryManager:
         disk_only: list[str],
         ghost_only: list[str],
     ) -> None:
-        """浏览名字级 diff 命中（磁盘与快照集合不一致）：回退 FS 扫描 + 入队 reconcile。
+        """浏览完整性探测命中（快照与磁盘不一致）：回退 FS 扫描 + 入队 reconcile。
+
+        v2.6.48（A 方案）起**只有幽灵侧**（索引有、磁盘无）会走到这里——调用方
+        `_list_files_via_index` 已不再做全目录名字 diff，故 `disk_only` 恒为空列表。
+        参数保留原签名是为了不动唯一的调用点与日志字段；`disk_only` 留给后续
+        「显式 verify」通道复用。
 
         与旧计数探测的区别：重命名/移动是 -1+1 计数守恒，旧探测永远打不中；
-        名字 diff 对任何一侧的单条差异都敏感。回退本身保证**本次**响应正确，
-        reconcile 负责把快照修对，后续浏览恢复索引快速路径。
+        幽灵检测对「索引里的旧名字在磁盘已消失」这种情况必然敏感。
+        回退本身保证**本次**响应正确，reconcile 负责把快照修对，
+        后续浏览恢复索引快速路径。
         """
         disk_preview = ", ".join(disk_only[:5]) + ("…" if len(disk_only) > 5 else "")
         ghost_preview = ", ".join(ghost_only[:5]) + ("…" if len(ghost_only) > 5 else "")
         logger.warning(
-            "[索引完整性] 浏览目录磁盘与快照名字不一致，回退文件系统并入队 reconcile:"
+            "[索引完整性] 浏览目录存在幽灵条目（索引有/磁盘无），回退文件系统并入队 reconcile:"
             " lib=%s path=%s disk_only(%d)=[%s] ghost_only(%d)=[%s]",
             library.id,
             dir_path,

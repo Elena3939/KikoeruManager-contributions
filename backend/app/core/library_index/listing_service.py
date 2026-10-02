@@ -193,8 +193,11 @@ def build_library_listing(
 
     ``mode=index``（默认）：纯快照读，零磁盘 IO。
     ``mode=verify``：快照读之后对**当前层**逐条 os.stat（一层，不递归，不做全树扫描），
-    与磁盘不一致的条目标 ``stale=true``；快照里没有而磁盘上有的条目附在
-    ``disk_only``（统一形状）里一并返回，并入队该子树 reconcile 增量重建。
+    与磁盘不一致的条目标 ``stale=true``；快照条目磁盘已消失（幽灵）与
+    快照里没有而磁盘上有的条目（disk_only）都会触发该子树 reconcile 入队。
+    **注意**：disk_only 这一步（一层 readdir）**仅在本页覆盖整个目录时执行** ——
+    大目录用游标翻页时 ``entries`` 只是切片，与 ``os.scandir`` 全量做差集会把
+    「本页之后的条目」整批误判成 disk_only（v2.6.48 修复，见 `_verify_current_layer`）。
     stat 失败（远程/网络盘等）自动回落 index 模式并标 ``verify_failed=true``，
     不阻塞页面。``stat_layer=True`` 等价于 ``mode=verify``（程序化调用口）。
     """
@@ -218,6 +221,15 @@ def build_library_listing(
     entries = list(payload.get("entries") or [])
     next_cursor = str(payload.get("next_page_cursor") or "")
     has_more = bool(next_cursor)
+    # 本页是否覆盖**整个目录**（verify 磁盘差集的判据，见 _verify_current_layer）：
+    # 用了游标就必然是切片；只有「无游标 + 无下一页 + 声明总数不超过本页条数」才是全量。
+    # list_children_page 恒传 include_total=True，故 payload["total"] 是目录全量声明数。
+    declared_total = int(payload.get("total") or 0)
+    page_covers_directory = (
+        not has_more
+        and not bool(payload.get("used_page_cursor"))
+        and declared_total <= len(entries)
+    )
 
     generation, fresh_at = _index_generation_metadata(service, library.id)
 
@@ -225,14 +237,26 @@ def build_library_listing(
     verify_failed = False
     stale_paths: set[str] = set()
     disk_only_raws: list[dict[str, Any]] = []
+    ghost_paths: list[str] = []
     valid_entries: list[Any] = list(entries)
 
     if want_verify and library.type == "local":
-        verify_failed, valid_entries, stale_paths, disk_only_raws = _verify_current_layer(
-            library, service, parent_path, entries
+        (
+            verify_failed,
+            valid_entries,
+            stale_paths,
+            disk_only_raws,
+            ghost_paths,
+        ) = _verify_current_layer(
+            library,
+            service,
+            parent_path,
+            entries,
+            page_covers_directory=page_covers_directory,
         )
-        if disk_only_raws:
-            # 快照缺条目 => 物化滞后或 watcher 漏事件，入队子树 reconcile（阶段 3 前的护栏）
+        if disk_only_raws or ghost_paths:
+            # 快照缺条目 / 存在幽灵 => 物化滞后或 watcher 漏事件，入队子树 reconcile
+            # （阶段 3 前的护栏）。v2.6.48 起幽灵也单独构成触发条件，不再只依赖 disk_only。
             _enqueue_subtree_reconcile(library, parent_path)
 
     source = "verify" if want_verify else "index"
@@ -263,18 +287,28 @@ def _verify_current_layer(
     service: Any,
     parent_path: str,
     entries: List[Any],
-) -> tuple[bool, List[Any], set[str], list[dict[str, Any]]]:
+    *,
+    page_covers_directory: bool = True,
+) -> tuple[bool, List[Any], set[str], list[dict[str, Any]], list[str]]:
     """对当前层做一层浅扫。
 
-    返回 ``(verify_failed, valid_entries, stale_relative_paths, disk_only_raws)``：
+    返回 ``(verify_failed, valid_entries, stale_relative_paths, disk_only_raws, ghost_paths)``：
     - stat 异常（目录不可达/远程盘）→ verify_failed=True，调用方回落 index；
     - 快照条目 stat 不一致 → 标 stale（但保留在 valid_entries 里）；
-    - 快照条目磁盘已消失/类型变化 → **幽灵条目，不进 valid_entries、不进响应**；
+    - 快照条目磁盘已消失/类型变化 → **幽灵条目**：进 ghost_paths、不进 valid_entries、不进响应；
     - 磁盘有而快照没有 → disk_only_raws（统一形状 raw，附进响应）。
+
+    ``page_covers_directory``（v2.6.48）：**仅当本页覆盖整个目录时才执行第 2 步磁盘差集**。
+    旧实现无条件差集，但 ``entries`` 是 ``limit=page_size`` 的**本页**、``os.scandir`` 是
+    **全量**，于是任何子项数 > page_size 的目录都会把「本页之后的条目」整批误判成
+    disk_only：响应里塞入重复条目（且超过 page_size），并**每次 verify 都误触发一次
+    子树 reconcile**（与 FIX_PLAN §3.2.1 描述的自激循环同源）。判据由调用方按
+    ``payload["total"]`` / 游标算出，本函数不额外做 IO。
     """
     verify_failed = False
     stale_paths: set[str] = set()
     disk_only_raws: list[dict[str, Any]] = []
+    ghost_paths: list[str] = []
 
     # 1) 快照条目逐个 stat：缺失/类型变化 → 幽灵条目（丢弃）；内容不一致 → 标 stale 保留
     valid_entries: List[Any] = []
@@ -289,15 +323,22 @@ def _verify_current_layer(
             is_dir = os.path.isdir(absolute)
         except OSError:
             stale_paths.add(rel)
+            ghost_paths.append(rel)
             continue  # 幽灵条目：不进响应
         if (getattr(entry, "entry_type", "") == "dir") != bool(is_dir):
             stale_paths.add(rel)
+            ghost_paths.append(rel)
             continue
         valid_entries.append(entry)
         if _entry_stat_is_stale(entry, stat_result):
             stale_paths.add(rel)
 
     # 2) 磁盘直接子项 vs 快照：磁盘有而快照没有 → disk_only（一层 readdir，不递归）
+    #    仅在「本页覆盖整个目录」时执行，否则差集没有意义（本页之外的条目会被整批
+    #    算成 disk_only）。ghost_paths 已在上一步单独收集，不受本步骤跳过影响。
+    if not page_covers_directory:
+        return verify_failed, valid_entries, stale_paths, disk_only_raws, ghost_paths
+
     target_abs = os.path.join(root_abs, *parent_path.split("/")) if parent_path else root_abs
     try:
         indexed_names = {str(getattr(entry, "name", "") or "") for entry in valid_entries}
@@ -323,6 +364,6 @@ def _verify_current_layer(
                 })
     except OSError:
         # 当前层不可达：verify 失败，回落 index 模式（stale 不标，快照行原样返回）
-        return True, list(entries), set(), []
+        return True, list(entries), set(), [], []
 
-    return verify_failed, valid_entries, stale_paths, disk_only_raws
+    return verify_failed, valid_entries, stale_paths, disk_only_raws, ghost_paths
