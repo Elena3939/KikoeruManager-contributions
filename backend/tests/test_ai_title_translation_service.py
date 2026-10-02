@@ -109,6 +109,169 @@ def test_completion_kwargs_uses_configured_max_tokens():
 
 
 # ---------------------------------------------------------------------------
+# 推理模型「正文为空」回归（v2.6.45）
+#
+# 用户实测：服务商控制台显示输出 12,304 token，本地日志却是 error=模型返回为空。
+# 根因：推理模型把输出全花在 reasoning_content，标准 content 为空，而流式解析
+# 只读 content 字段，且没有任何诊断日志可看出「模型其实返回了什么」。
+# 这里固定三件事：
+#   1. 流式路径要能从非 content 字段回退取到正文（不报空响应）；
+#   2. 通用收集不硬编码字段名（未知自定义字段也要收到）；
+#   3. usage 按字段 merge，不能被后续分片整体覆盖丢证据。
+# ---------------------------------------------------------------------------
+
+class _FakeStream:
+    """带 __aiter__ 的假流式响应，让 _call_model 走流式分支。"""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+def _delta_chunk(delta: dict, *, finish_reason: str = "", usage: dict | None = None) -> dict:
+    chunk: dict = {"choices": [{"delta": delta, "finish_reason": finish_reason}]}
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
+
+
+def _install_fake_litellm_stream(monkeypatch: pytest.MonkeyPatch, chunks: list) -> None:
+    async def acompletion(**kwargs):
+        return _FakeStream(chunks)
+
+    monkeypatch.setitem(sys.modules, "litellm", types.SimpleNamespace(acompletion=acompletion))
+
+
+def test_extract_verbose_picks_reasoning_when_content_empty():
+    from app.core.ai_subtitle_match_service import extract_litellm_stream_delta_verbose
+
+    chunk = _delta_chunk({"content": "", "reasoning_content": "让我分析这个标题…"})
+    primary, collected, _usage, _reason = extract_litellm_stream_delta_verbose(chunk)
+    assert primary == "让我分析这个标题…"
+    assert collected["reasoning_content"] == "让我分析这个标题…"
+    assert "content" not in collected  # 空内容不入收集
+
+
+def test_extract_verbose_collects_unknown_custom_field():
+    """通用性：未预置的字段名也要能收到，不为具体模型写特判。"""
+    from app.core.ai_subtitle_match_service import extract_litellm_stream_delta_verbose
+
+    chunk = _delta_chunk({"content": "", "answer_text": "自定义字段正文"})
+    primary, collected, _usage, _reason = extract_litellm_stream_delta_verbose(chunk)
+    assert collected.get("answer_text") == "自定义字段正文"
+    assert primary == "自定义字段正文"
+
+
+def test_extract_verbose_prefers_content_over_reasoning():
+    from app.core.ai_subtitle_match_service import extract_litellm_stream_delta_verbose
+
+    chunk = _delta_chunk({"content": "正文", "reasoning_content": "思考"})
+    primary, collected, _usage, _reason = extract_litellm_stream_delta_verbose(chunk)
+    assert primary == "正文"
+    assert collected["reasoning_content"] == "思考"
+
+
+def test_exclude_structural_fields_from_text_collection():
+    from app.core.ai_subtitle_match_service import extract_litellm_stream_delta_verbose
+
+    chunk = _delta_chunk({"role": "assistant", "content": "x", "tool_calls": [{"id": "1"}]})
+    _primary, collected, _usage, _reason = extract_litellm_stream_delta_verbose(chunk)
+    assert "role" not in collected
+    assert "tool_calls" not in collected
+    assert collected["content"] == "x"
+
+
+def test_verbose_returns_usage_and_finish_reason():
+    from app.core.ai_subtitle_match_service import extract_litellm_stream_delta_verbose
+
+    chunk = _delta_chunk({}, finish_reason="stop", usage={"completion_tokens": 12304})
+    _primary, _collected, usage, reason = extract_litellm_stream_delta_verbose(chunk)
+    assert usage["completion_tokens"] == 12304
+    assert reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_stream_reasoning_only_content_is_used_not_failed(monkeypatch):
+    """核心回归：推理模型只在 reasoning_content 输出时，必须取到正文而非判失败。"""
+    _install_fake_litellm_stream(monkeypatch, [
+        _delta_chunk({"content": "", "reasoning_content": "（思考）先分析日文标题"},
+                    usage={"prompt_tokens": 10}),
+        _delta_chunk({"content": "", "reasoning_content": "圣职者姐妹"}, usage={"completion_tokens": 12304}),
+        _delta_chunk({}, finish_reason="stop"),
+    ])
+    service = AITitleTranslationService()
+    result = await service.translate_single("タイトル", _config())
+    assert result["success"] is True, result
+    assert "圣职者姐妹" in result["translated_title"]
+
+
+@pytest.mark.asyncio
+async def test_stream_usage_merged_across_chunks(monkeypatch):
+    """usage 必须按字段 merge：后面的分片不能把前面的 token 计数覆盖掉。"""
+    captured: dict = {}
+
+    async def acompletion(**kwargs):
+        return _FakeStream([
+            _delta_chunk({"content": "a"}, usage={"prompt_tokens": 10}),
+            _delta_chunk({"content": "b"}, usage={"completion_tokens": 12304}),
+            _delta_chunk({}, finish_reason="stop"),
+        ])
+
+    monkeypatch.setitem(sys.modules, "litellm", types.SimpleNamespace(acompletion=acompletion))
+    service = AITitleTranslationService()
+
+    original = service._call_model
+
+    async def spy(config, work_name):
+        content, usage = await original(config, work_name)
+        captured["usage"] = usage
+        return content, usage
+
+    monkeypatch.setattr(service, "_call_model", spy)
+    result = await service.translate_single("タイトル", _config())
+    assert result["success"] is True, result
+    # 两个字段分别来自不同分片，merge 后都要在。
+    assert captured["usage"]["prompt_tokens"] == 10
+    assert captured["usage"]["completion_tokens"] == 12304
+
+
+def test_non_retryable_error_does_not_include_truncation():
+    """⚠️ 截断必须保持可重试（既有 test_truncation_retries_then_succeeds 依赖）。"""
+    from app.core.ai_title_translation_service import _is_non_retryable_error
+
+    assert _is_non_retryable_error(ValueError(
+        "模型输出达到 max_tokens 上限（200）被截断，请在 AI 标题汉化设置中调大输出 token 上限"
+    )) is False
+    assert _is_non_retryable_error(ValueError("模型返回了不完整的 JSON（缺少结束括号），输出可能被截断")) is True
+    assert _is_non_retryable_error(ValueError("Authentication Fails, Your api key is invalid")) is True
+    assert _is_non_retryable_error(TimeoutError("read timeout")) is False
+    assert _is_non_retryable_error(ConnectionError("connection reset by peer")) is False
+
+
+@pytest.mark.asyncio
+async def test_auth_error_does_not_retry(monkeypatch):
+    """认证失败属确定性错误：不应重试（实测一次失败空转 16 秒）。"""
+    calls = {"n": 0}
+
+    async def acompletion(**kwargs):
+        calls["n"] += 1
+        raise RuntimeError("Authentication Fails, Your api key: ****jRhL is invalid")
+
+    monkeypatch.setitem(sys.modules, "litellm", types.SimpleNamespace(acompletion=acompletion))
+    service = AITitleTranslationService()
+    result = await service.translate_single("タイトル", _config(max_retries=3))
+    assert result["success"] is False
+    assert calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
 # /api/ai-title-translation/test 接口回归
 #
 # v2.5.26 用户实测：设置页"AI 标题汉化 → 测试连接"点击无反应。双重根因：
