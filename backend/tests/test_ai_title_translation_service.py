@@ -361,3 +361,125 @@ def test_test_endpoint_masked_api_key_falls_back_to_disk(client, monkeypatch):
     data = resp.json()
     assert data["success"] is True
     assert capture["kwargs"]["api_key"] == "sk-saved-on-disk"
+
+
+# ---------------------------------------------------------------------------
+# 推理模型「思考被当成答案」回归（v2.6.50）
+#
+# 用户实测：推理模型把全部输出写在 reasoning_content（10200 字），content 为空。
+# v2.6.45 为防「有输出却判空」把 reasoning_content 提升为主文本，导致思考文本
+# 被当答案送进 JSON 校验，报 `Extra data: line 4 column 1 (char 84)` 这类与事实
+# 不符的错误（模型其实没返回坏 JSON，是解析对象错了）。
+#
+# 这里固定：
+#   1. 思考字段绝不进入返回文本（正文只由 content/text/未知自定义字段拼成）；
+#   2. 思考里含多个 {} 片段时，回退路径必须宽松提取、不得报「JSON 无法解析」；
+#   3. 正文为 JSON 时，历史严格行为不变；
+#   4. ⚠️ v2.6.45 红线（无 {} 的思考文本仍被判成功）不得回归。
+# ---------------------------------------------------------------------------
+
+def test_pick_answer_piece_skips_reasoning_fields():
+    from app.core.ai_title_translation_service import _pick_answer_piece
+
+    assert _pick_answer_piece({"reasoning_content": "思考中"}) == ""
+    assert _pick_answer_piece({"reasoning": "思考中", "thinking": "更多思考"}) == ""
+    assert _pick_answer_piece({"content": "正文"}) == "正文"
+    assert _pick_answer_piece({"reasoning_content": "思考", "content": "正文"}) == "正文"
+    # 未知自定义字段（非思考类）仍可作答案，保持通用性。
+    assert _pick_answer_piece({"answer_text": "自定义正文"}) == "自定义正文"
+    assert _pick_answer_piece({"reasoning_content": "思考", "answer_text": "自定义正文"}) == "自定义正文"
+
+
+def test_scan_first_json_object_ignores_fragmented_braces():
+    from app.core.ai_title_translation_service import _scan_first_json_object
+
+    # 思考文本里先有示例、再有真答案：扫描应取到第一个可解析的 dict。
+    text = '我们需要回答用户。{key: value} 输出 JSON 格式：\n{"作品": "标题翻译"}\n综上。'
+    assert _scan_first_json_object(text) == {"作品": "标题翻译"}
+    # 完全扫不到合法 dict。
+    assert _scan_first_json_object("没有任何括号") is None
+    assert _scan_first_json_object("{不是合法JSON }") is None
+
+
+def test_extract_translation_text_reasoning_fallback_no_strict_json_error():
+    from app.core.ai_title_translation_service import _extract_translation_text
+
+    # 思考文本：多个 {} 片段 + 夹带真答案；回退路径不得抛「JSON 无法解析」。
+    reasoning = (
+        "用户要求：输出 JSON 格式，key 为原文，value 为翻译结果：\n"
+        '分析：{"ごめんね": "对不起"}\n'
+        "综上，翻译完成。{补充说明}"
+    )
+    out = _extract_translation_text(reasoning, reasoning_fallback=True)
+    assert "对不起" in out
+
+
+def test_extract_translation_text_reasoning_fallback_plain_text():
+    from app.core.ai_title_translation_service import _extract_translation_text
+
+    # 思考文本没有任何 JSON：按纯文本返回（去包裹引号），不报错。
+    out = _extract_translation_text("「思考：直接翻译即可」", reasoning_fallback=True)
+    assert out == "思考：直接翻译即可"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_content_with_fragmented_braces_does_not_fail_as_bad_json(monkeypatch):
+    """核心回归：推理模型只在 reasoning_content 输出、且思考里含多个 {} 片段。"""
+    _install_fake_litellm_stream(monkeypatch, [
+        _delta_chunk({"content": "", "reasoning_content": "用户要求输出 JSON 格式：{key: value}\n我准备翻译："}),
+        _delta_chunk({"content": "", "reasoning_content": '{"タイトル": "标题翻译"}\n综上，完成。'}),
+        _delta_chunk({}, finish_reason="stop"),
+    ])
+    service = AITitleTranslationService()
+    result = await service.translate_single("タイトル", _config(max_retries=0))
+    assert result["success"] is True, result
+    assert "标题翻译" in result["translated_title"]
+    # 绝不能出现误导性的「JSON 无法解析」。
+    assert "无法解析" not in str(result.get("error", {}))
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_without_braces_still_succeeds(monkeypatch):
+    """⚠️ v2.6.45 红线：无 {} 的思考文本必须仍被判成功（不得因本次修复回归）。
+
+    这条与既有的 test_stream_reasoning_only_content_is_used_not_failed 同义，
+    额外把「content 非空时思考不参与正文」的新语义一并锁住。
+    """
+    _install_fake_litellm_stream(monkeypatch, [
+        _delta_chunk({"content": "", "reasoning_content": "（思考）先分析日文标题"}),
+        _delta_chunk({"content": "", "reasoning_content": "圣职者姐妹"}),
+        _delta_chunk({}, finish_reason="stop"),
+    ])
+    service = AITitleTranslationService()
+    result = await service.translate_single("タイトル", _config())
+    assert result["success"] is True, result
+    assert "圣职者姐妹" in result["translated_title"]
+
+
+@pytest.mark.asyncio
+async def test_content_present_reasoning_excluded_from_answer(monkeypatch):
+    """content 与 reasoning_content 同时存在：正文只含 content，思考不混入。"""
+    _install_fake_litellm_stream(monkeypatch, [
+        _delta_chunk({"content": "", "reasoning_content": "思考部分不该出现"}),
+        _delta_chunk({"content": '{"タイトル": "正确标题"}'}),
+        _delta_chunk({}, finish_reason="stop"),
+    ])
+    service = AITitleTranslationService()
+    result = await service.translate_single("タイトル", _config())
+    assert result["success"] is True, result
+    assert result["translated_title"] == "正确标题"
+    assert "思考部分" not in result["translated_title"]
+
+
+@pytest.mark.asyncio
+async def test_content_json_still_strictly_parsed(monkeypatch):
+    """正文就是 JSON 映射：历史严格行为不变（多值重新 dump、单值取值）。"""
+    _install_fake_litellm_stream(monkeypatch, [
+        _delta_chunk({"content": '{"作品": "标题翻译", "01文件": "01翻译"}'}),
+        _delta_chunk({}, finish_reason="stop"),
+    ])
+    service = AITitleTranslationService()
+    result = await service.translate_single("作品", _config())
+    assert result["success"] is True, result
+    assert "标题翻译" in result["translated_title"]
+    assert "01翻译" in result["translated_title"]

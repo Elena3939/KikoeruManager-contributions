@@ -26,6 +26,15 @@ MASKED_SECRET = "********"
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 _proxy_lock = asyncio.Lock()
 
+# 「思考」类字段：模型把推理过程写在这里，**不是翻译答案**。
+# 它们可以进入诊断日志（便于排障），但绝不能当作标题/JSON 答案送去解析——
+# 否则会拿大段思考文本去做 JSON 校验，报出与事实不符的「模型返回的 JSON 无法解析」。
+_REASONING_FIELD_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+# 「答案」类字段的优先顺序：正文（content / text）优先。未知自定义字段（如
+# answer_text）同样可作答案，只要它不是思考类字段——保持「不硬编码字段名」。
+_ANSWER_FIELD_KEYS = ("content", "text")
+
 
 
 
@@ -263,6 +272,115 @@ def _pick_fallback_text(collected: Dict[str, str]) -> Tuple[str, str]:
     return "", ""
 
 
+def _scan_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """在任意文本里**扫描**出第一个可解析的 JSON 对象（成功返回 dict，否则 None）。
+
+    与「首 ``{`` 到末 ``}`` 切片再 ``json.loads``」的区别：切片会跨越文本里
+    多个不相邻的 ``{}`` 片段拼成一个非法串（典型报错 ``Extra data``）；本函数用
+    ``JSONDecoder.raw_decode`` 从每个 ``{`` 位置独立尝试，命中即返回，不跨界拼接。
+
+    只接受 dict（翻译映射的形态）。
+    """
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(text)
+    while index < length:
+        start = text.find("{", index)
+        if start < 0:
+            return None
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        if isinstance(obj, dict):
+            return obj
+        index = end if end > start else start + 1
+    return None
+
+
+def _extract_translation_text(
+    content: str,
+    *,
+    reasoning_fallback: bool = False,
+    request_label: str = "",
+) -> str:
+    """把模型输出清成「翻译文本」，并处理 JSON 映射形态。
+
+    参数：
+    - ``reasoning_fallback``：``content`` 是否来自**思考字段回退**。思考文本里的
+      ``{}`` 只是推理片段，不是答案，因此**不做严格的首末切片校验**，只用扫描式
+      提取；扫不到就当纯文本处理。
+
+    规则（未回退时与历史行为保持一致，避免影响普通模型）：
+    1. 正文本身是 JSON 映射 → 单值取值、多值重新 dump（原逻辑）。
+    2. 有 ``{`` 无 ``}`` 且未回退 → 判截断残骸（原逻辑，防垃圾名写库）。
+    3. 无 ``{`` → 纯文本清洗。
+
+    回退（思考文本）路径额外做：扫描出第一个 JSON 对象即用它；扫不到就按纯文本
+    清洗返回。**绝不因为「思考里有零散 {} 」而报 JSON 解析失败**。
+    """
+    text = str(content or "").strip()
+    if not text:
+        return text
+
+    json_start = text.find("{")
+    json_end = text.rfind("}") + 1
+    has_brace_span = json_start >= 0 and json_end > json_start
+
+    if reasoning_fallback:
+        # 思考文本：宽松扫描，不做严格切片校验。
+        parsed = _scan_first_json_object(text)
+        if isinstance(parsed, dict):
+            values = [v.strip() for v in parsed.values() if isinstance(v, str) and v.strip()]
+            if len(values) == 1:
+                return values[0]
+            if len(values) > 1:
+                return json.dumps(parsed, ensure_ascii=False)
+        # 扫描不到可用映射：按纯文本清洗（去掉包裹引号）。
+        return text.strip().strip('"').strip("'").strip("「").strip("」").strip()
+
+    if has_brace_span:
+        try:
+            parsed = json.loads(text[json_start:json_end])
+        except json.JSONDecodeError as exc:
+            # 严格路径解析失败：再给一次「扫描取首个对象」的机会（应对正文里
+            # 意外夹带多个 {} 的情况），仍失败才报错，并把诊断信息带上。
+            scanned = _scan_first_json_object(text)
+            if isinstance(scanned, dict):
+                values = [v.strip() for v in scanned.values() if isinstance(v, str) and v.strip()]
+                if len(values) == 1:
+                    return values[0]
+                if len(values) > 1:
+                    return json.dumps(scanned, ensure_ascii=False)
+            preview = sanitize_text_for_log(text[:200])
+            if request_label:
+                logger.error(
+                    "[AI标题] %s JSON 解析失败（解析对象=正文，非思考回退）: %s | 预览=%s",
+                    request_label,
+                    exc,
+                    preview,
+                )
+            # JSON 残骸不能当翻译结果传下去，否则会被直接用作文件夹 / 文件新名字
+            raise ValueError(
+                f"模型返回的 JSON 无法解析或不完整: {exc}（解析对象为模型正文，"
+                f"预览：{preview}）"
+            ) from exc
+        if isinstance(parsed, dict):
+            values = [v.strip() for v in parsed.values() if isinstance(v, str) and v.strip()]
+            if len(values) == 1:
+                return values[0]
+            if len(values) > 1:
+                return json.dumps(parsed, ensure_ascii=False)
+            raise ValueError("模型返回的 JSON 没有可用翻译结果")
+    elif json_start >= 0:
+        # 有 '{' 没有 '}'：典型的输出截断残骸，绝不能当标题使用
+        raise ValueError("模型返回了不完整的 JSON（缺少结束括号），输出可能被截断")
+    return text.strip().strip('"').strip("'").strip("「").strip("」").strip()
+
+
 def _describe_empty_response(
     usage: Dict[str, int], finish_reason: str, collected: Dict[str, str]
 ) -> str:
@@ -310,6 +428,12 @@ async def _consume_litellm_stream(
     内容才能区分「模型有输出但字段不对」与「模型真的没输出」。这里用通用收集
     （``extract_litellm_stream_delta_verbose``）而不是硬编码字段名，不为任何具体
     模型写特判。
+
+    ⚠️ **正文只由「答案类」字段（content / text / 未知自定义字段）拼成**：
+    ``reasoning_content`` 等思考字段只进诊断汇总，**绝不进入返回值文本**。
+    历史缺陷（用户实测「推理模型翻译必失败，报 JSON 无法解析 / Extra data」）：
+    思考字段曾参与主文本选择，导致 1 万字的思考被当答案，再被 JSON 首末切片校验
+    报出与事实不符的解析错误。
     """
     from .ai_subtitle_match_service import (
         extract_litellm_stream_delta_verbose,
@@ -331,8 +455,12 @@ async def _consume_litellm_stream(
             saw_any_fields = True
             for key, text in collected.items():
                 accumulated[key] = accumulated.get(key, "") + text
-        if delta:
-            parts.append(delta)
+        # ★ 只接受「答案类」字段进入正文；思考类字段（reasoning_content 等）只进
+        # 诊断汇总。`delta` 是 verbose 变体选出的「主文本」，它可能来自思考字段，
+        # 因此这里**不用 delta**，改为从 collected 自行判定。
+        answer_piece = _pick_answer_piece(collected)
+        if answer_piece:
+            parts.append(answer_piece)
         usage = _merge_stream_usage(usage, chunk_usage)
         if chunk_finish:
             finish_reason = chunk_finish
@@ -350,7 +478,9 @@ async def _consume_litellm_stream(
         )
         log_collected_text_fields("[AI标题]", accumulated, label=request_label)
         if not content and accumulated:
-            # 决定性诊断：模型有输出、只是没落在 content 字段上。
+            # 决定性诊断：模型有输出、只是没落在正文（content）字段上。典型是
+            # 推理模型把输出全花在 reasoning_content——注意这**不是翻译答案**，
+            # 后续会以「回退」方式处理并明确标记。
             logger.warning(
                 "[AI标题] %s 正文(content)为空，但模型实际返回了其他文本字段: %s",
                 request_label,
@@ -363,6 +493,31 @@ async def _consume_litellm_stream(
                 chunk_count,
             )
     return content, usage, finish_reason, accumulated
+
+
+def _pick_answer_piece(collected: Dict[str, str]) -> str:
+    """从单个分片的已收集字段里挑出**属于答案**的那部分文本（拼接用）。
+
+    规则：
+    - 思考类字段（``reasoning_content`` / ``reasoning`` / ``thinking``）**一律跳过**；
+    - 优先 ``content`` / ``text``；
+    - 其余未知自定义字段（如 ``answer_text``）按插入顺序取第一个，保持通用性。
+
+    思考字段被排除是本函数存在的唯一理由：它承载的是模型的推理过程，
+    不是翻译结果。
+    """
+    if not collected:
+        return ""
+    for key in _ANSWER_FIELD_KEYS:
+        text = collected.get(key)
+        if text:
+            return text
+    for key, text in collected.items():
+        if key in _REASONING_FIELD_KEYS:
+            continue
+        if text:
+            return text
+    return ""
 
 
 def _is_azure_config(config: Dict[str, Any]) -> bool:
@@ -538,6 +693,7 @@ class AITitleTranslationService:
                         finish_reason = _extract_finish_reason(response)
                         collected_fields = _collect_non_stream_text_fields(response)
                         _log_non_stream_response_fields(request_label, response, collected_fields)
+                reasoning_fallback = False
                 if not content and collected_fields:
                     # 模型有输出、但正文没落在 content 字段上（推理模型把思考写在
                     # reasoning_content 是典型形态）。在**不改动原字段语义**的前提下
@@ -545,11 +701,15 @@ class AITitleTranslationService:
                     # ⚠️ 不走「推理模型特判」：任何非空文本字段都可回退，通用有效。
                     fallback_key, fallback_text = _pick_fallback_text(collected_fields)
                     if fallback_text:
+                        reasoning_fallback = fallback_key in _REASONING_FIELD_KEYS
                         logger.warning(
-                            "[AI标题] %s 正文为空，回退使用字段[%s]（%s 字符）作为翻译结果",
+                            "[AI标题] %s 正文为空，回退使用字段[%s]（%s 字符）作为翻译结果%s",
                             request_label,
                             fallback_key,
                             len(fallback_text),
+                            "；该字段是思考文本，将按宽松规则提取，不做严格 JSON 校验"
+                            if reasoning_fallback
+                            else "",
                         )
                         content = fallback_text
                         if not usage.get("completion_tokens") and not usage.get("total_tokens"):
@@ -562,29 +722,11 @@ class AITitleTranslationService:
                         "请在 AI 标题汉化设置中调大输出 token 上限"
                     )
                 # 清理输出：尝试提取 JSON，如果 AI 返回了 {key: value} 格式则解析
-                import json as _json
-                content = content.strip()
-                json_start = content.find('{')
-                json_end = content.rfind('}') + 1
-                if json_start >= 0 and json_end > json_start:
-                    try:
-                        parsed = _json.loads(content[json_start:json_end])
-                    except _json.JSONDecodeError as exc:
-                        # JSON 残骸不能当翻译结果传下去，否则会被直接用作文件夹 / 文件新名字
-                        raise ValueError(f"模型返回的 JSON 无法解析或不完整: {exc}") from exc
-                    if isinstance(parsed, dict):
-                        values = [v.strip() for v in parsed.values() if isinstance(v, str) and v.strip()]
-                        if len(values) == 1:
-                            content = values[0]
-                        elif len(values) > 1:
-                            content = _json.dumps(parsed, ensure_ascii=False)
-                        else:
-                            raise ValueError("模型返回的 JSON 没有可用翻译结果")
-                elif json_start >= 0:
-                    # 有 '{' 没有 '}'：典型的输出截断残骸，绝不能当标题使用
-                    raise ValueError("模型返回了不完整的 JSON（缺少结束括号），输出可能被截断")
-                else:
-                    content = content.strip().strip('"').strip("'").strip("「").strip("」").strip()
+                content = _extract_translation_text(
+                    content,
+                    reasoning_fallback=reasoning_fallback,
+                    request_label=request_label,
+                )
                 if _is_refusal_text(content):
                     # 模型拒答（如"抱歉，我无法协助翻译这段内容"）必须当失败处理，
                     # 否则拒答文案会被写进 ai_title 并用作文件夹新名字。
