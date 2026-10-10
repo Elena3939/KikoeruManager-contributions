@@ -5362,3 +5362,76 @@ Encrypted = +
         failures = task.task_metadata['nested_archive_failures']
         assert isinstance(failures, list)
         assert any('failing.zip' in str(item) for item in failures)
+
+
+# ---------------------------------------------------------------------------
+# 问题 3：伪装后缀多卷 / 前缀壳分卷（RJ01625284 场景）
+# ---------------------------------------------------------------------------
+
+class TestVolumeMemberGuard:
+    """`_path_is_volume_member` + `_prepare_embedded_archive` 安全闸门。
+
+    回归线上 bug：用户的 part1.rar / part2.rar 分卷（首卷带 444416 字节前缀壳）
+    被 find_embedded_archive 误判为 polyglot，剥离成脱离目录的单体临时视图，
+    7zz 拿不到兄弟卷 → Headers Error + Wrong password。
+    """
+
+    def _service(self, tmp_path):
+        service = ExtractService()
+        return service
+
+    def test_path_is_volume_member_partN_rar(self, tmp_path):
+        service = ExtractService()
+        p = tmp_path / "RJ01625284.part1.rar"
+        p.write_bytes(b"x" * 2048)
+        assert service._path_is_volume_member(str(p)) is True
+
+    def test_path_is_volume_member_partN_disguised_ext(self, tmp_path):
+        service = ExtractService()
+        p = tmp_path / "RJ01625284.part2.r4r"
+        p.write_bytes(b"x" * 2048)
+        assert service._path_is_volume_member(str(p)) is True
+
+    def test_path_is_volume_member_7z_and_z_and_r(self, tmp_path):
+        service = ExtractService()
+        for name in ("a.7z.001", "a.z01", "a.r00"):
+            p = tmp_path / name
+            p.write_bytes(b"x" * 2048)
+            assert service._path_is_volume_member(str(p)) is True, name
+
+    def test_path_is_volume_member_numeric_needs_sibling(self, tmp_path):
+        service = ExtractService()
+        lone = tmp_path / "lone.001"
+        lone.write_bytes(b"x" * 2048)
+        assert service._path_is_volume_member(str(lone)) is False
+
+        (tmp_path / "grp.001").write_bytes(b"x" * 2048)
+        (tmp_path / "grp.002").write_bytes(b"x" * 2048)
+        assert service._path_is_volume_member(str(tmp_path / "grp.001")) is True
+
+    def test_path_is_volume_member_plain_single_archive_is_false(self, tmp_path):
+        """普通单体压缩包（含带前缀壳的 polyglot）不应被判为分卷成员。"""
+        service = ExtractService()
+        p = tmp_path / "RJ01625284.rar"
+        p.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"x" * 4096)
+        assert service._path_is_volume_member(str(p)) is False
+
+    @pytest.mark.asyncio
+    async def test_prepare_embedded_archive_skips_volume_member(self, tmp_path, monkeypatch):
+        """分卷成员不得被剥离成脱离目录的临时视图。"""
+        service = ExtractService()
+        p = tmp_path / "RJ01625284.part1.rar"
+        # 构造一个"头部不是 RAR 签名、但 444416 之后有 RAR 签名"的前缀壳文件，
+        # 让 find_embedded_archive 有足够理由误判为 polyglot。
+        p.write_bytes(b"\x00" * 64 + b"Rar!\x1a\x07\x01\x00" + b"\x00" * (8192 - 72))
+
+        task = Task(task_type=TaskType.EXTRACT, source_path=str(p))
+        task.task_metadata = {}
+
+        async def _never_called(*args, **kwargs):  # pragma: no cover
+            raise AssertionError("分卷成员不应进入剥离流程")
+
+        monkeypatch.setattr(service, "_prepare_embedded_zip_archive", _never_called)
+
+        result = await service._prepare_embedded_archive(str(p), task, materialize=True)
+        assert result is None

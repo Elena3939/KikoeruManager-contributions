@@ -2372,6 +2372,17 @@ class ExtractService:
         materialize: bool = True,
     ) -> Optional[str]:
         """????? MP4/??????? RAR/7z payload ?????ZIP ? _prepare_embedded_zip_archive??"""
+        # 安全闸门：如果该文件本身已是「多卷组」的成员（partN.rar / zNN / rNN /
+        # 7z.NNN / 纯数字分卷 + 同目录兄弟），绝不能把首卷剥离成脱离目录的单体
+        # 临时视图 —— 那会让 7zz 丢掉兄弟卷，报 Headers Error + Wrong password。
+        # 判据不含"单卷主名 + 前缀壳"（那种情况仍需剥离），只看是否命中分卷模式。
+        if self._path_is_volume_member(archive_path):
+            logger.info(
+                "[Extract] 该文件是分卷组成员，跳过多卷前缀壳剥离: %s",
+                archive_path,
+            )
+            return None
+
         zip_view = await self._prepare_embedded_zip_archive(archive_path, task, materialize=materialize)
         if zip_view is not None:
             return zip_view
@@ -2499,13 +2510,33 @@ class ExtractService:
         # 2. 修复后缀名
         self._set_extract_meta(task, extract_stage="detect_type")
         task.update_progress(10, "检测文件类型")
-        # 视频壳 / 媒体壳里嵌 ZIP 时，Linux 下的 7zz 不能稳定识别前缀。
-        # 一旦命中就直接生成纯 ZIP 临时视图，避免清单阶段把结构错误误判为密码错误。
-        embedded_zip_direct_path = await self._prepare_embedded_archive(
-            archive_path,
-            task,
-            materialize=True,
-        )
+        # ⚠️ 顺序很重要：分卷探测必须跑在「剥离前缀壳生成 polyglot 临时视图」之前。
+        #
+        # 历史缺陷（用户 RJ01625284「正确密码却报 Wrong password / Headers Error」）：
+        # 用户把伪装后缀的分卷改名为标准名（如 part1.3x3 → part1.rar，但保留了
+        # 首卷前的 444416 字节壳）。此时 find_embedded_archive 会在偏移 444416 命
+        # 中 RAR 签名 → 判定为"带前缀伪装的单体压缩包"，把原文件剥离成一个
+        # /temp/xxx.rar 单一临时视图 → 该视图脱离了原目录，**看不到 part2.rar 兄
+        # 弟卷**，7zz 只能拿残缺单卷解压，必然报 Headers Error + Wrong password。
+        #
+        # 因此在剥离之前先按原始路径做一次分卷探测：只要原始路径成组，就走分卷
+        # 链路（entry_path 保留原目录，兄弟卷可见），绝不生成脱离目录的临时视图。
+        original_volume_set = self._detect_volume_set(archive_path)
+        if original_volume_set:
+            logger.info(
+                "[Extract] 原始路径已识别为分卷组(%s)，跳过多卷前缀壳剥离: %s",
+                original_volume_set.type,
+                archive_path,
+            )
+            embedded_zip_direct_path = None
+        else:
+            # 视频壳 / 媒体壳里嵌 ZIP 时，Linux 下的 7zz 不能稳定识别前缀。
+            # 一旦命中就直接生成纯 ZIP 临时视图，避免清单阶段把结构错误误判为密码错误。
+            embedded_zip_direct_path = await self._prepare_embedded_archive(
+                archive_path,
+                task,
+                materialize=True,
+            )
         if embedded_zip_direct_path:
             archive_path = embedded_zip_direct_path
         else:
@@ -2518,7 +2549,7 @@ class ExtractService:
                 task.source_path = archive_path
 
         # 3. 检查是否是分卷
-        volume_set = self._detect_volume_set(archive_path)
+        volume_set = original_volume_set or self._detect_volume_set(archive_path)
         if not volume_set:
             # _detect_volume_set 没认出分卷组：在进入单体解压链路之前先跑一道
             # 启发式"伪装多卷"探测。命中（首卷魔数 + 同前缀连续数字兄弟 +
@@ -4602,6 +4633,16 @@ class ExtractService:
             logger.info(f"跳过无扩展名的分卷压缩文件后缀名修复: {file_path}")
             return file_path
 
+        # 跳过「伪装后缀的 partN 分卷」：xxx.part2.r4r / xxx.part3.3x3 等。
+        # 这类文件的后缀被故意改乱（r4r 改 rar、3x3 改 7z），若走通用后缀修复会
+        # 被 _normalize_filename 只保留 RJ 号，把 xxx.part2.r4r 改成 xxx.rar ——
+        # 分卷序号 part2 被抹掉，与首卷断开，7zz 只能看到残缺单卷。
+        # 判据：basename 里出现 ``.part<数字>.`` 即视作分卷成员，保留原名交给
+        # 分卷探测（_detect_volume_set）与伪装多卷流程处理。
+        if re.search(r'\.part\d+\.', filename, re.IGNORECASE):
+            logger.info(f"跳过伪装后缀的 partN 分卷文件后缀名修复: {file_path}")
+            return file_path
+
         # 跳过 ZIP 分卷压缩文件 (.z01, .z02, ...)
         if re.search(r'\.z\d+$', filename, re.IGNORECASE):
             logger.info(f"跳过 ZIP 分卷压缩文件后缀名修复: {file_path}")
@@ -4732,6 +4773,13 @@ class ExtractService:
                 "[Normalize] 检测到带前缀伪装压缩包（偏移 %s），保持原始文件名: %s",
                 embedded_offset, file_path,
             )
+            return file_path
+
+        # 伪装后缀的 partN 分卷成员（xxx.part2.r4r 等）：必须保留原名。若走通用
+        # 规范化，_normalize_filename 只留 RJ 号，会把 part2 序号抹掉改成品名.扩展，
+        # 与首卷断开。这里直接原地保留，交给分卷探测/伪装多卷流程处理。
+        if re.search(r'\.part\d+\.', filename, re.IGNORECASE):
+            logger.info(f"[Normalize] 伪装后缀的 partN 分卷，保持原始文件名: {file_path}")
             return file_path
 
         # 检查是否是分卷压缩文件
@@ -5329,6 +5377,54 @@ class ExtractService:
                     return VolumeSet(base_name, volumes, vtype, entry_path=volumes[0])
 
         return None
+
+    def _path_is_volume_member(self, file_path: str) -> bool:
+        """判断路径是否属于「多卷组」成员（含首卷），只看命名 + 同目录兄弟，不读文件。
+
+        与 ``_detect_volume_set`` 的区别：本方法**只做命名/兄弟层面的判定**，不关心
+        文件内部是否真的是该格式的首卷，因此可以安全地在「剥离前缀壳」之前调用，
+        用来防止把分卷首卷误剥成脱离目录的单体视图。
+
+        命中条件（任一）：
+        - ``.partN.rar|zip|7z|exe`` 或 ``.partN``（无扩展名）
+        - ``.7z.NNN``
+        - ``.zNN``（ZIP 分卷）
+        - ``.rNN``（旧式 RAR 分卷）
+        - 纯数字 ``.NNN`` 且同目录存在同前缀的其它数字兄弟
+        """
+        if not file_path:
+            return False
+        filename = os.path.basename(file_path)
+        if not filename:
+            return False
+
+        generic_patterns = (
+            r'\.part\d+\.',      # partN.任意后缀（含 r4r / 3x3 等伪装后缀）
+            r'\.part\d+$',       # partN 无扩展名
+            r'\.7z\.\d{3}$',
+            r'\.z\d{2}$',
+            r'\.r\d{2}$',
+        )
+        for pattern in generic_patterns:
+            if re.search(pattern, filename, re.IGNORECASE):
+                return True
+
+        # 纯数字分卷（X.001 / X.002）：必须有同前缀的数字兄弟才算，避免把
+        # 孤立的数据文件误判。
+        numeric_match = re.search(r'^(?P<base>.+)\.(?P<index>\d{3})$', filename)
+        if numeric_match:
+            base_name = numeric_match.group('base')
+            directory = os.path.dirname(file_path)
+            try:
+                for sibling in os.listdir(directory):
+                    if sibling == filename:
+                        continue
+                    if re.fullmatch(rf'{re.escape(base_name)}\.\d{{3}}', sibling, re.IGNORECASE):
+                        return True
+            except OSError:
+                return False
+
+        return False
 
     def _build_zip_volume_set(self, directory: str, base_name: str) -> Optional['VolumeSet']:
         zip_path = os.path.join(directory, f"{base_name}.zip")
@@ -9461,11 +9557,14 @@ class ExtractService:
 
         if (
             last_corrupt_stderr
-            and self._is_sfx_temporary_volume_view_path(archive_info.path, task)
+            and (
+                self._is_sfx_temporary_volume_view_path(archive_info.path, task)
+                or self._path_is_volume_member(archive_info.path)
+            )
             and self._looks_like_incomplete_volume_error(last_corrupt_stderr)
         ):
             logger.error(
-                "SFX 临时分卷视图返回不完整分卷特征，优先判定为 volume_incomplete: archive=%s stderr=%s",
+                "分卷视图返回不完整分卷特征，优先判定为 volume_incomplete: archive=%s stderr=%s",
                 archive_info.path,
                 last_corrupt_stderr[:300],
             )
