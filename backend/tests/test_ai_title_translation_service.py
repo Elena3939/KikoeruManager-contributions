@@ -483,3 +483,178 @@ async def test_content_json_still_strictly_parsed(monkeypatch):
     assert result["success"] is True, result
     assert "标题翻译" in result["translated_title"]
     assert "01翻译" in result["translated_title"]
+
+
+# ---------------------------------------------------------------------------
+# v2.6.50 二次修复：思考文本不得整段当标题（用户实测 RJ01668964）
+#
+# v2.6.50 首版把 reasoning_content 排除出正文后，回退路径「宽松提取」在
+# **思考里没有 JSON** 时会把整段 9638 字思考当标题返回，导致 [RENAME] 把文件夹
+# 改名成「[RJ01668964][我们需要回答用户。用户要求充当翻译家…」。
+#
+# 这里固定：
+#   1. 思考文本里有「翻译：」等标记 → 抠出答案行；
+#   2. 长 / 多行思考且抠不到答案 → 明确失败，绝不返回整段思考；
+#   3. ⚠️ 短单行思考（v2.6.45 形态，如「圣职者姐妹」）仍照常接受，不得回归；
+#   4. 候选标题超长 / 多行分析措辞 → 拒绝（防垃圾名写库）。
+# ---------------------------------------------------------------------------
+
+def test_looks_like_reasoning_text_short_single_line_is_not_reasoning():
+    from app.core.ai_title_translation_service import _looks_like_reasoning_text
+
+    # v2.6.45 形态：短单行 → 不是思考，必须照常接受。
+    assert _looks_like_reasoning_text("圣职者姐妹") is False
+    assert _looks_like_reasoning_text("这是翻译后的标题") is False
+    # 长文本 → 是思考。
+    assert _looks_like_reasoning_text("很长" * 400) is True
+    # 多行 + 分析措辞 → 是思考。
+    assert _looks_like_reasoning_text("我们需要回答用户。\n用户要求翻译成中文。\n逐条分析。") is True
+
+
+def test_extract_answer_from_reasoning_marker():
+    from app.core.ai_title_translation_service import _extract_answer_from_reasoning
+
+    text = (
+        "我们需要回答用户。用户要求翻译。\n"
+        "日文标题：\nごめんね、マネージャーくん\n"
+        "翻译：\n对不起，经纪人君\n"
+        "或“抱歉呢”\n需要自然。"
+    )
+    assert _extract_answer_from_reasoning(text) == "对不起，经纪人君"
+
+
+def test_extract_translation_text_reasoning_with_marker_returns_answer():
+    from app.core.ai_title_translation_service import _extract_translation_text
+
+    reasoning = (
+        "我们需要回答用户。用户要求充当翻译家，输出 JSON 格式。\n"
+        "日文标题：\nごめんね、マネージャーくん ～イケメス特撮女優の肉体改造アクメ地獄堕ち報告～\n"
+        "翻译：\n对不起，经纪人君 ～帅哥系特摄女演员的肉体改造高潮地狱堕落报告～\n"
+        "或“抱歉呢，经纪人小弟”\n需要自然。"
+    )
+    out = _extract_translation_text(reasoning, reasoning_fallback=True)
+    assert out == "对不起，经纪人君 ～帅哥系特摄女演员的肉体改造高潮地狱堕落报告～"
+
+
+def test_extract_translation_text_long_reasoning_without_answer_fails():
+    """核心回归：长思考且无标记答案 → 必须失败，绝不返回整段思考。"""
+    from app.core.ai_title_translation_service import _extract_translation_text
+
+    long_reasoning = "我们需要回答用户。用户要求翻译。\n逐条分析中……\n综上，需要再想想。" + "这段思考很长。" * 300
+    with pytest.raises(ValueError) as exc_info:
+        _extract_translation_text(long_reasoning, reasoning_fallback=True)
+    assert "思考" in str(exc_info.value)
+
+
+def test_extract_translation_text_short_single_line_reasoning_accepted():
+    """⚠️ v2.6.45 兼容：短单行推理字段内容仍可作为答案返回。"""
+    from app.core.ai_title_translation_service import _extract_translation_text
+
+    assert _extract_translation_text("圣职者姐妹", reasoning_fallback=True) == "圣职者姐妹"
+
+
+def test_reject_overlong_plain_text_title():
+    from app.core.ai_title_translation_service import _extract_translation_text
+
+    with pytest.raises(ValueError):
+        _extract_translation_text("很长" * 400)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_long_text_does_not_pollute_title(monkeypatch):
+    """端到端：思考里没有可提取答案时，任务必须失败而不是把思考写进标题。"""
+    _install_fake_litellm_stream(monkeypatch, [
+        _delta_chunk({"content": "", "reasoning_content": "我们需要回答用户。用户要求翻译成中文。"}),
+        _delta_chunk({"content": "", "reasoning_content": "逐条分析：\n第一，确定语种。\n第二，决定用词。\n综上，还需再想。" + "很长思考。" * 200}),
+        _delta_chunk({}, finish_reason="stop"),
+    ])
+    service = AITitleTranslationService()
+    result = await service.translate_single("タイトル", _config(max_retries=0))
+    assert result["success"] is False, result
+    assert result["translated_title"] is None
+
+
+# ---------------------------------------------------------------------------
+# max_tokens 由运营商自报额度决定（发现式，不硬编码模型名）
+# ---------------------------------------------------------------------------
+
+def test_resolve_max_tokens_uses_user_value_when_within_limit():
+    service = AITitleTranslationService()
+    cfg = _config(model="m", api_base="https://api.example.com", max_tokens=4096)
+    assert service._resolve_max_tokens(cfg) == 4096
+
+
+def test_resolve_max_tokens_clamps_to_discovered_provider_limit():
+    from app.core.ai_subtitle_match_service import (
+        cache_model_token_limits,
+        _model_token_limits_cache,
+    )
+
+    _model_token_limits_cache.clear()
+    cache_model_token_limits(
+        "https://api.example.com",
+        [{"id": "m", "max_output_tokens": 8192}],
+    )
+    service = AITitleTranslationService()
+    cfg = _config(model="m", api_base="https://api.example.com", max_tokens=99999)
+    assert service._resolve_max_tokens(cfg) == 8192
+
+
+def test_resolve_max_tokens_falls_back_to_conservative_when_unknown():
+    from app.core.ai_subtitle_match_service import _model_token_limits_cache
+
+    _model_token_limits_cache.clear()
+    service = AITitleTranslationService()
+    cfg = _config(model="unknown-model", api_base="https://api.example.com", max_tokens=200000)
+    # 未发现运营商上限 → 保守兜底，绝不把超大值透传给服务端
+    assert service._resolve_max_tokens(cfg) == AITitleTranslationService._FALLBACK_MAX_OUTPUT_TOKENS
+
+
+def test_resolve_max_tokens_never_below_200():
+    service = AITitleTranslationService()
+    cfg = _config(model="m", api_base="https://api.example.com", max_tokens=1)
+    assert service._resolve_max_tokens(cfg) >= 200
+
+
+def test_extract_model_token_limits_deepseek_shape():
+    from app.core.ai_subtitle_match_service import extract_model_token_limits
+
+    limits = extract_model_token_limits({
+        "id": "deepseek-reasoner",
+        "context_window": 128000,
+        "max_output_tokens": 65536,
+    })
+    assert limits["max_output_tokens"] == 65536
+    assert limits["context_window"] == 128000
+
+
+def test_extract_model_token_limits_aliases_and_nested():
+    from app.core.ai_subtitle_match_service import extract_model_token_limits
+
+    limits = extract_model_token_limits({
+        "id": "some-model",
+        "context_length": 32000,
+        "top_provider": {"max_output_tokens": 4096},
+    })
+    assert limits["max_output_tokens"] == 4096
+    assert limits["context_window"] == 32000
+
+
+def test_extract_model_token_limits_missing_fields_default_zero():
+    from app.core.ai_subtitle_match_service import extract_model_token_limits
+
+    limits = extract_model_token_limits({"id": "x"})
+    assert limits == {"max_output_tokens": 0, "context_window": 0}
+
+
+def test_normalize_model_entries_carries_limits():
+    from app.core.ai_subtitle_match_service import AISubtitleMatchService
+
+    service = AISubtitleMatchService()
+    rows = service._normalize_model_entries(
+        {"data": [{"id": "m", "max_output_tokens": 8192, "context_window": 128000}]},
+        {"api_base": "https://api.example.com"},
+    )
+    assert len(rows) == 1
+    assert rows[0]["max_output_tokens"] == 8192
+    assert rows[0]["context_window"] == 128000

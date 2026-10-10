@@ -61,6 +61,97 @@ def _config_to_dict(config: Any) -> Dict[str, Any]:
     }
 
 
+# 运营商 /models 响应里「输出上限」与「上下文窗口」的常见字段名（含各家别名）。
+# 这是 OpenAI 兼容 API 的事实约定：DeepSeek 用 max_output_tokens / context_window，
+# 其他中转常用 context_length / max_context_length / max_tokens 等。这里只做**发现**，
+# 不硬编码任何具体模型名——换模型由运营商自己报，程序自适应。
+_MODEL_OUTPUT_LIMIT_KEYS = (
+    "max_output_tokens",
+    "max_completion_tokens",
+    "max_output_length",
+    "output_token_limit",
+    "max_tokens",
+)
+_MODEL_CONTEXT_WINDOW_KEYS = (
+    "context_window",
+    "context_length",
+    "max_context_length",
+    "max_context_tokens",
+    "context_size",
+)
+
+
+def extract_model_token_limits(entry: Any) -> Dict[str, int]:
+    """从单个 /models 条目里抠出 ``max_output_tokens`` 与 ``context_window``。
+
+    返回 ``{"max_output_tokens": int, "context_window": int}``，取不到的字段为 0。
+    嵌套结构（如 ``top_provider.max_output_tokens`` / ``per_request_limits``）也会
+    下探一层，兼容 OpenRouter 之类的聚合网关。
+    """
+    limits = {"max_output_tokens": 0, "context_window": 0}
+    if not isinstance(entry, dict):
+        return limits
+
+    def _first_int(container: Any, keys: Tuple[str, ...]) -> int:
+        if not isinstance(container, dict):
+            return 0
+        for key in keys:
+            value = _safe_int(container.get(key))
+            if value > 0:
+                return value
+        return 0
+
+    limits["max_output_tokens"] = _first_int(entry, _MODEL_OUTPUT_LIMIT_KEYS)
+    limits["context_window"] = _first_int(entry, _MODEL_CONTEXT_WINDOW_KEYS)
+    # 下探一层嵌套容器（top_provider / per_request_limits 等）。
+    for nested_key in ("top_provider", "per_request_limits", "limits", "provider"):
+        nested = entry.get(nested_key)
+        if not isinstance(nested, dict):
+            continue
+        if not limits["max_output_tokens"]:
+            limits["max_output_tokens"] = _first_int(nested, _MODEL_OUTPUT_LIMIT_KEYS)
+        if not limits["context_window"]:
+            limits["context_window"] = _first_int(nested, _MODEL_CONTEXT_WINDOW_KEYS)
+    return limits
+
+
+# 运算符自报额度缓存：{(api_base, model_id): {"max_output_tokens": int, "context_window": int}}。
+# 由 ``list_models`` 成功时写入（用户点「获取模型」或在设置页打开时触发），
+# 翻译/配对请求在此**只读**——避免每次调用都多打一次 /models 网络请求。
+_model_token_limits_cache: Dict[Tuple[str, str], Dict[str, int]] = {}
+
+
+def cache_model_token_limits(api_base: str, models: List[Dict[str, Any]]) -> None:
+    """把 ``list_models`` 拿到的模型额度写进缓存（供请求侧只读查询）。"""
+    base = _safe_text(api_base).rstrip("/").lower()
+    if not base:
+        return
+    for row in models or []:
+        if not isinstance(row, dict):
+            continue
+        model_id = _safe_text(row.get("id") or row.get("value"))
+        if not model_id:
+            continue
+        limits = {
+            "max_output_tokens": _safe_int(row.get("max_output_tokens")),
+            "context_window": _safe_int(row.get("context_window")),
+        }
+        if limits["max_output_tokens"] or limits["context_window"]:
+            _model_token_limits_cache[(base, model_id.lower())] = limits
+
+
+def lookup_model_output_limit(api_base: str, model_id: str) -> int:
+    """查询运算符自报的 ``max_output_tokens``；未发现过返回 0。"""
+    base = _safe_text(api_base).rstrip("/").lower()
+    model = _safe_text(model_id).lower()
+    if not base or not model:
+        return 0
+    limits = _model_token_limits_cache.get((base, model))
+    if not limits:
+        return 0
+    return _safe_int(limits.get("max_output_tokens"))
+
+
 def _extract_litellm_content(response: Any) -> Tuple[str, Dict[str, int]]:
     usage_obj = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
     if usage_obj is None:
@@ -834,6 +925,7 @@ class AISubtitleMatchService:
             if not value or value in seen:
                 continue
             seen.add(value)
+            limits = extract_model_token_limits(item)
             models.append({
                 "id": model_id,
                 "value": value,
@@ -841,6 +933,9 @@ class AISubtitleMatchService:
                 "owned_by": _safe_text(item.get("owned_by") or item.get("owner") or item.get("model")),
                 "created": item.get("created"),
                 "source": "azure_deployments" if is_azure else "openai_compatible_models",
+                # 运营商自报的额度（取不到为 0，前端据此决定是否展示/夹取）。
+                "max_output_tokens": limits["max_output_tokens"],
+                "context_window": limits["context_window"],
             })
         return sorted(models, key=lambda row: str(row.get("id") or "").lower())
 
@@ -901,6 +996,11 @@ class AISubtitleMatchService:
                 raise RuntimeError(f"{response.status_code} {response.reason_phrase}: {summary}")
             payload = response.json()
             models = self._normalize_model_entries(payload, config, is_azure=is_azure)
+            # 把运营商自报的额度写入缓存，供翻译/配对请求侧只读夹取，避免重复网络请求。
+            cache_model_token_limits(
+                config.get("api_base") or "https://api.openai.com/v1",
+                models,
+            )
             duration_ms = int((time.perf_counter() - started) * 1000)
             logger.info(
                 "[AI字幕] 获取模型列表完成: model_count=%s duration_ms=%s base_url=%s provider=%s",

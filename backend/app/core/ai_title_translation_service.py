@@ -35,6 +35,40 @@ _REASONING_FIELD_KEYS = ("reasoning_content", "reasoning", "thinking")
 # answer_text）同样可作答案，只要它不是思考类字段——保持「不硬编码字段名」。
 _ANSWER_FIELD_KEYS = ("content", "text")
 
+# 作品标题的长度上界（字符）。超过即判「不是标题」——用于拒绝把整段思考写库。
+# 实测最长的正常标题（含副标题 / 特典后缀）远小于此值。
+_MAX_TITLE_CHARS = 300
+
+# 思考文本里常见的分析性措辞：多行文本命中这些词即视为思考过程（拒绝写库）。
+_REASONING_TEXT_MARKERS = (
+    "我们需要回答用户",
+    "用户要求",
+    "需要翻译成",
+    "逐条",
+    "综上",
+    "分析：",
+    "可能输出",
+    "需要决定",
+    "保留原样",
+    "指的是",
+    "可以译为",
+    "注意原文",
+)
+
+# 推理模型把答案也写在思考里时，答案行常见的引导别名（取第一个命中）。
+_ANSWER_LINE_MARKERS = (
+    "翻译结果：",
+    "翻译结果:",
+    "译文：",
+    "译文:",
+    "翻译：",
+    "翻译:",
+    "答案：",
+    "答案:",
+    "结果：",
+    "结果:",
+)
+
 
 
 
@@ -301,6 +335,63 @@ def _scan_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _looks_like_reasoning_text(text: str) -> bool:
+    """判断一段文本是否像「思考过程」而不是「翻译答案」。
+
+    用于兜底拒绝：思考文本动辄数千字、含大量分析性措辞与多行结构，
+    绝不能作为作品标题写库 / 改名。
+
+    注意与 v2.6.45 的兼容：**短的单行文本一律不算思考**——推理模型常把最终答案
+    直接写在 reasoning_content 末尾（如「圣职者姐妹」16 字），那种必须照常接受。
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    # 单行且不超长 → 不是思考过程（v2.6.45 的典型形态）。
+    if "\n" not in stripped and len(stripped) <= _MAX_TITLE_CHARS:
+        return False
+    if len(stripped) > _MAX_TITLE_CHARS:
+        return True
+    # 多行且命中分析性措辞 → 视为思考。
+    if any(marker in stripped for marker in _REASONING_TEXT_MARKERS):
+        return True
+    # 多行且行数较多 → 视为思考（标题不会是多行段落）。
+    return len([line for line in stripped.splitlines() if line.strip()]) > 3
+
+
+def _extract_answer_from_reasoning(text: str) -> str:
+    """从思考文本里「抠出」翻译答案行；抠不到返回空串。
+
+    推理模型把正文也写在 ``reasoning_content`` 时，答案通常出现在
+    ``翻译：``/``翻译结果：``/``答案：`` 之类别名之后（用户实测形态）。这里按行
+    扫描取**第一条**该类标记后的内容；没有标记则返回空串（**不猜**）。
+
+    返回结果仍受长度闸门约束，超长视为失败（由调用方处理）。
+    """
+    lines = str(text or "").splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for marker in _ANSWER_LINE_MARKERS:
+            position = stripped.find(marker)
+            if position < 0:
+                continue
+            candidate = stripped[position + len(marker):].strip()
+            candidate = candidate.strip('"').strip("'").strip("「").strip("」").strip()
+            if candidate and len(candidate) <= _MAX_TITLE_CHARS:
+                return candidate
+            # 标记后为空 → 答案在下一行
+            for follow in lines[index + 1:]:
+                follow_stripped = follow.strip().strip('"').strip("'").strip("「").strip("」").strip()
+                if not follow_stripped:
+                    continue
+                if len(follow_stripped) <= _MAX_TITLE_CHARS:
+                    return follow_stripped
+                break
+    return ""
+
+
 def _extract_translation_text(
     content: str,
     *,
@@ -311,36 +402,59 @@ def _extract_translation_text(
 
     参数：
     - ``reasoning_fallback``：``content`` 是否来自**思考字段回退**。思考文本里的
-      ``{}`` 只是推理片段，不是答案，因此**不做严格的首末切片校验**，只用扫描式
-      提取；扫不到就当纯文本处理。
+      ``{}`` 只是推理片段，不是答案；而整段思考更是**绝不能当标题写库**（用户实测：
+      v2.6.50 曾把 9638 字的思考过程直接当成标题改名，污染了文件夹名）。
 
     规则（未回退时与历史行为保持一致，避免影响普通模型）：
     1. 正文本身是 JSON 映射 → 单值取值、多值重新 dump（原逻辑）。
     2. 有 ``{`` 无 ``}`` 且未回退 → 判截断残骸（原逻辑，防垃圾名写库）。
     3. 无 ``{`` → 纯文本清洗。
 
-    回退（思考文本）路径额外做：扫描出第一个 JSON 对象即用它；扫不到就按纯文本
-    清洗返回。**绝不因为「思考里有零散 {} 」而报 JSON 解析失败**。
+    回退（思考文本）路径：
+    a. 先扫描 JSON 对象，命中即用；
+    b. 否则按 ``翻译：`` 之类别名抠出答案行；
+    c. **仍取不到、或取到的东西像思考过程（多行 / 超长）→ 明确失败**，
+       绝不把整段思考当标题返回。
     """
     text = str(content or "").strip()
     if not text:
         return text
 
-    json_start = text.find("{")
-    json_end = text.rfind("}") + 1
-    has_brace_span = json_start >= 0 and json_end > json_start
-
     if reasoning_fallback:
-        # 思考文本：宽松扫描，不做严格切片校验。
+        # a. 思考里可能夹带真正的 JSON 答案。
         parsed = _scan_first_json_object(text)
         if isinstance(parsed, dict):
             values = [v.strip() for v in parsed.values() if isinstance(v, str) and v.strip()]
             if len(values) == 1:
-                return values[0]
+                return _reject_if_reasoning_like(values[0], request_label=request_label)
             if len(values) > 1:
                 return json.dumps(parsed, ensure_ascii=False)
-        # 扫描不到可用映射：按纯文本清洗（去掉包裹引号）。
-        return text.strip().strip('"').strip("'").strip("「").strip("」").strip()
+        # b. 按「翻译：」等标记抠答案行。
+        answer = _extract_answer_from_reasoning(text)
+        if answer:
+            return _reject_if_reasoning_like(answer, request_label=request_label)
+        # c. 无标记：**短的单行文本**可直接当答案（v2.6.45 兼容——推理模型常把
+        #    最终答案直接写在推理字段里，如「圣职者姐妹」），只需过一遍长度/形态闸门。
+        if not _looks_like_reasoning_text(text):
+            return text.strip().strip('"').strip("'").strip("「").strip("」").strip()
+        # d. 长/多行的思考文本且抠不到答案：绝不返回整段思考。
+        preview = sanitize_text_for_log(text[:200])
+        if request_label:
+            logger.error(
+                "[AI标题] %s 思考文本回退无法提取翻译答案（长度=%s），拒绝写库 | 预览=%s",
+                request_label,
+                len(text),
+                preview,
+            )
+        raise ValueError(
+            "模型把正文写在了思考字段(reasoning_content)，且其中没有可识别的翻译结果；"
+            "为避免把整段思考当成标题，本次判失败。建议改用非推理模型，或在提示词中明确"
+            "要求「只输出 JSON、不要输出分析过程」"
+        )
+
+    json_start = text.find("{")
+    json_end = text.rfind("}") + 1
+    has_brace_span = json_start >= 0 and json_end > json_start
 
     if has_brace_span:
         try:
@@ -378,7 +492,26 @@ def _extract_translation_text(
     elif json_start >= 0:
         # 有 '{' 没有 '}'：典型的输出截断残骸，绝不能当标题使用
         raise ValueError("模型返回了不完整的 JSON（缺少结束括号），输出可能被截断")
-    return text.strip().strip('"').strip("'").strip("「").strip("」").strip()
+    cleaned = text.strip().strip('"').strip("'").strip("「").strip("」").strip()
+    return _reject_if_reasoning_like(cleaned, request_label=request_label)
+
+
+def _reject_if_reasoning_like(candidate: str, *, request_label: str = "") -> str:
+    """候选标题若「像思考过程」则判失败，避免垃圾名写库 / 改名。"""
+    if _looks_like_reasoning_text(candidate):
+        preview = sanitize_text_for_log(str(candidate)[:200])
+        if request_label:
+            logger.error(
+                "[AI标题] %s 候选标题像思考过程（长度=%s），拒绝写库 | 预览=%s",
+                request_label,
+                len(str(candidate)),
+                preview,
+            )
+        raise ValueError(
+            f"模型返回的内容像思考过程而非翻译结果（长度={len(str(candidate))}），"
+            f"为避免污染标题已判失败。预览：{preview}"
+        )
+    return candidate
 
 
 def _describe_empty_response(
@@ -596,6 +729,46 @@ class AITitleTranslationService:
         ]
 
 
+    # 发现不到运营商上限时的绝对兜底：任何 OpenAI 兼容服务端都不至于连 8192 都拒绝，
+    # 避免用户手填一个超大值直接把请求打成 400。
+    _FALLBACK_MAX_OUTPUT_TOKENS = 8192
+
+    def _resolve_max_tokens(self, config: Dict[str, Any]) -> int:
+        """决定本次请求实际使用的 ``max_tokens``（**不硬编码模型名**）。
+
+        规则：
+        1. 用户填的值作为「期望上限」，取不到时默认 4096（历史行为，防 JSON 截断）。
+        2. 向运营商自报的额度看齐（``/models`` 的 ``max_output_tokens`` 缓存，由
+           ``list_models`` 写入）：用户值**超过**运营商上限时**软夹取**到运营商上限，
+           既不报错也不会被服务端截断。
+        3. 运营商额度未知（中转不返回该字段 / 用户没点过「获取模型」）时，夹取到
+           保守兜底 ``_FALLBACK_MAX_OUTPUT_TOKENS``，防止越界 400。
+        4. 下限恒为 200（防截断）。
+        """
+        requested = max(200, _safe_int(config.get("max_tokens"), 4096))
+        api_base = _safe_text(config.get("api_base"))
+        model = _safe_text(config.get("model"))
+        discovered = 0
+        if api_base and model:
+            try:
+                from .ai_subtitle_match_service import lookup_model_output_limit
+
+                discovered = lookup_model_output_limit(api_base, model)
+            except Exception:
+                discovered = 0
+        ceiling = discovered if discovered > 0 else self._FALLBACK_MAX_OUTPUT_TOKENS
+        if requested > ceiling:
+            logger.info(
+                "[AI标题] max_tokens 按运营商上限夹取: 用户值=%s -> 实际=%s（%s） model=%s",
+                requested,
+                ceiling,
+                "运营商自报" if discovered > 0 else "保守兜底",
+                model or "(未设置)",
+            )
+            return max(200, ceiling)
+        return requested
+
+
     def _completion_kwargs(
         self,
         config: Dict[str, Any],
@@ -609,7 +782,7 @@ class AITitleTranslationService:
             "temperature": float(config.get("temperature", 0.1)),
             # 文件级重命名会返回「作品标题 + 全部文件名」的 JSON 映射，200 token 必被截断，
             # 截断的 JSON 残骸曾被当成翻译结果直接把项目文件夹重命名成垃圾名，这里默认放宽到 4096。
-            "max_tokens": max(200, _safe_int(config.get("max_tokens"), 4096)),
+            "max_tokens": self._resolve_max_tokens(config),
         }
         api_key = _safe_text(config.get("api_key"))
         if api_key:
