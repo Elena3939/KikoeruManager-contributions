@@ -296,3 +296,84 @@ while True:
 
 版本：**v2.6.50**。
 
+---
+
+## 10. 二次修复（v2.6.51）：思考文本不得整段当标题（用户实测 RJ01668964）
+
+### 10.1 首版遗漏的失效路径
+v2.6.50 上线后用户实测 `RJ01668964`（日志行 135571-135807）：
+- 字段依旧只有 `reasoning_content`（9638 字符），`content` 为空；
+- 首版改动生效：`_pick_answer_piece` 正确拒绝思考 → 正文为空 → 回退分支触发并打印
+  `正文为空，回退使用字段[reasoning_content]（9637 字符）作为翻译结果；该字段是思考文本，将按宽松规则提取`；
+- **但回退路径在思考里「扫不到 JSON」时直接 `return` 了整段思考**（旧实现第 343 行
+  `return text.strip()...`）→ 9638 字思考被当标题返回 → `[RENAME] 替换work_name后:
+  '[RJ01668964][我们需要回答用户。用户要求充当翻译家，把任何语言翻译成中文，自然流畅地道…'`
+  → **文件夹名被污染**（这正是 v2.6.45 各项保护要防的事故形态）。
+
+**关键事实**：该思考文本里 `grep -c '{'` = **0**，一个花括号都没有 → 扫描式提取无从下手。
+
+### 10.2 与 v2.6.45 的张力及调和
+- **v2.6.45 红线**：推理模型只在 `reasoning_content` 输出时**必须取到正文而非判失败**
+  （用例 `test_stream_reasoning_only_content_is_used_not_failed`，思考内容
+  `（思考）先分析日文标题` + `圣职者姐妹`，**短、单行**）。
+- **本次用户诉求**：9 千字多行思考**不得**当正文。
+- **调和判据（形态而非字段名）**：
+  - **短 + 单行**（≤300 字、无换行）→ 视为「答案直接落在推理字段」，照常接受（兼容 v2.6.45）；
+  - **长 / 多行**（超 300 字，或多行且命中分析措辞 / 行数 > 3）→ 视为「思考过程」，
+    必须能从中**提取出答案**，否则**明确失败**。
+
+### 10.3 实施
+| 落点 | 内容 |
+|---|---|
+| 常量 | `_MAX_TITLE_CHARS = 300`；`_REASONING_TEXT_MARKERS`（「我们需要回答用户」「用户要求」「逐条」「综上」等 12 项）；`_ANSWER_LINE_MARKERS`（「翻译结果：」「翻译：」「译文：」「答案：」等 10 项） |
+| 新增 `_looks_like_reasoning_text()` | 形态判据（短单行→False；超长/多行分析措辞/行数>3→True） |
+| 新增 `_extract_answer_from_reasoning()` | 按 `_ANSWER_LINE_MARKERS` 逐行抠答案（标记后同行内容，或紧邻下一行），返回受长度闸门约束；抠不到返回 `""`（**不猜**） |
+| 新增 `_reject_if_reasoning_like()` | 候选标题若「像思考」则记 error 并抛错 |
+| `_extract_translation_text` 回退路径重写 | a. 扫描 JSON 命中即用 → b. 按标记抠答案 → c. **短单行**直接接受 → d. 否则**明确失败**（附「建议改用非推理模型或让提示词要求只输出 JSON」） |
+| 正常路径补充 | 纯文本兜底也过 `_reject_if_reasoning_like`，防超长正文直写 |
+
+### 10.4 验证
+- 用**真实思考文本**（日志还原）跑端到端：标题 =
+  `对不起，经纪人君 ～帅哥系特摄女演员的肉体改造高潮地狱堕落报告～`（正确）。
+- 无标记的长思考 → 明确失败，不再返回整段思考。
+- `test_ai_title_translation_service.py` **30 passed**（v2.6.50 为 23，二次修复 +7），
+  3 例 `client` fixture error 为预期；**v2.6.45 红线用例仍通过**。
+
+
+
+---
+
+## 11. 追加修复（v2.6.51）：输出上限由运营商上报决定 + 思考污染兜底收口
+
+日期：2026-10-10（用户续报 + 诉求）
+
+### 11.1 用户新诉求
+> 「怎么会有 4096 的输出上限呢，我的设置中输出上限调过了啊，是不是配置没保存？干脆去掉输出上限限制吧，改为运营商提供的上下文上下限算了」
+> 「deepseek-flash 就是 deepseek-v4.1-flash，你不要管模型是什么，毕竟以后可能换模型，导致问题，max_tokens 应该由接入的 ai 运营商的模型确定」
+
+### 11.2 排查结论（先回答「配置有没有丢」）
+- **配置没丢**：直连线上 `10.10.10.10:5555/api/config` 读回 `ai_title_translation.max_tokens = 32768`，保存成功。
+- 日志里的 4096 是 **10-02 13:45 的旧记录**（那时尚未调大，且 `finish_reason=length`）；15:21 报错那次是 `finish_reason=stop`，**根本没触发上限**，用的是当时的真实值。
+- 因此「15:21 失败」与「上限太小」**无关**，主因仍是模型把额度烧在思考上、`content` 为空。
+
+### 11.3 方案（用户批准「按推荐处理」= 方案 D）
+`max_tokens` 交由**运营商上报的额度**决定，**不硬编码模型名**（换模型自动适配）：
+| 落点 | 内容 |
+|---|---|
+| `ai_subtitle_match_service.py` 常量 | `_MODEL_OUTPUT_LIMIT_KEYS`（`max_output_tokens`/`max_completion_tokens`/…）、`_MODEL_CONTEXT_WINDOW_KEYS`（`context_window`/`context_length`/…） |
+| 新增 `extract_model_token_limits()` | 从单条目抠 `max_output_tokens` / `context_window`，下探 `top_provider`/`per_request_limits`/`limits`/`provider` 一层 |
+| 新增缓存 | `_model_token_limits_cache: {(api_base, model): limits}` + `cache_model_token_limits()` + `lookup_model_output_limit()` |
+| `_normalize_model_entries` | 条目新增 `max_output_tokens` / `context_window` 两字段 |
+| `list_models` | 成功时写缓存（供请求侧只读，**不额外发网络请求**） |
+| `ai_title_translation_service._resolve_max_tokens()` | 用户值→与运营商上限比较→**超限软夹取**（记日志）；未发现→保守兜底 `_FALLBACK_MAX_OUTPUT_TOKENS=8192`；下限 200 |
+| 前端 `AITitleTranslationSettingsPanel.vue` | 「自动」开关 + 「获取运营商上限」按钮 + 「运营商上报最大 N tokens」显示；`onMounted` 若已选自动则自动发现 |
+| 配置同步 | `settings.py` `AITitleTranslationConfig` 加 `max_tokens_auto`；前端 `useSettingsDraft` `defaultConfig` 加 `max_tokens_auto`（hydrate/serialize 为整体透传，无需改）；`routes.py` ConfigResponse 该段是 `Optional[dict]`，自动带过 |
+
+### 11.4 关键外部依据
+- DeepSeek 2026 `/models` 明确返回 `context_window`（输入+输出总容量）与 `max_output_tokens`（`max_tokens` 可接受的最大值）。
+- `max_tokens` 是**输出**上限，≠ 上下文窗口；直接填 128K 会 400。故「去掉上限」不可行，正确做法是**指向运营商上报值 + 保守兜底**。
+
+### 11.5 验证
+- 影响面（GitNexus）：`_normalize_model_entries` LOW/2、`list_models` LOW/1、`_completion_kwargs` LOW/≤8，改动集中在 3 符号内。
+- 单测：`test_ai_title_translation_service.py` **38 passed**（v2.6.50 为 30，本版 +8），3 例 `client` fixture error 为 `--noconftest` 预期。
+- 前端 `npm run build`：`✓ 4208 modules transformed`（safe-delete 守卫误拦 `dist/assets` 清空为已知沙箱现象，编译通过）。
