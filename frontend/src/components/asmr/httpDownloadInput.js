@@ -1,6 +1,6 @@
 const PIKPAK_HOSTS = new Set(['mypikpak.com', 'www.mypikpak.com', 'drive.mypikpak.com'])
 const PASS_CODE_QUERY_KEYS = ['pwd', 'pass_code', 'passcode', 'password', 'code']
-const PASS_CODE_FULL = /^[A-Za-z0-9]{4,12}$/
+const PASS_CODE_FULL = /^[A-Za-z0-9]{2,32}$/
 const URL_RE = /https?:\/\/[^\s<>"'\u3000-\u303f\u4e00-\u9fff]+/gi
 const NO_SCHEME_URL_RE = /(?<![A-Za-z0-9])(?:(?:pan|yun|eyun)\.baidu\.com|(?:mypikpak|drive\.mypikpak)\.com|(?:www\.)?gofile\.io|(?:www\.)?transfer\.it|1drv\.ms|onedrive\.live\.com|onedrive\.com|drive\.google\.com|docs\.google\.com|drive\.usercontent\.google\.com)(?:\/[^\s<>"'\u3000-\u303f\u4e00-\u9fff]*)?/gi
 const MARKDOWN_URL_RE = /\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/gi
@@ -24,17 +24,17 @@ function cleanUrlCandidate(raw) {
   let url = String(raw || '').trim()
   if (!url) return null
   let code = ''
-  const separator = url.match(/(?:----|---|--)\s*([A-Za-z0-9]{4,12})\s*$/i)
+  const separator = url.match(/(?:----|---|--)\s*([A-Za-z0-9]{2,32})\s*$/i)
   if (separator) {
     code = validPassCode(separator[1])
     url = url.slice(0, separator.index)
   }
-  const trailingLabel = url.match(/(?<![?&=])(?:提取码|提取口令|访问码|密[码碼]|pwd|passcode|pass_code|password|code|key)\s*[:：=]?\s*([A-Za-z0-9]{4,12})$/i)
+  const trailingLabel = url.match(/(?<![?&=])(?:提取码|提取口令|访问码|密[码碼]|pwd|passcode|pass_code|password|code|key)\s*[:：=]?\s*([A-Za-z0-9]{2,32})$/i)
   if (trailingLabel) {
     code = validPassCode(trailingLabel[1])
     url = url.slice(0, trailingLabel.index)
   } else {
-    const bareTrailing = url.match(/:([A-Za-z0-9]{4,12})$/)
+    const bareTrailing = url.match(/:([A-Za-z0-9]{2,32})$/)
     if (bareTrailing) {
       code = validPassCode(bareTrailing[1])
       url = url.slice(0, bareTrailing.index)
@@ -112,16 +112,16 @@ function extractPassCodeFromSegment(value, allowBare = false) {
   if (!segment) return ''
   const archiveContext = segmentHasArchiveContext(segment)
   const labelPattern = archiveContext
-    ? /(?:提取码|提取口令|访问码|pwd|passcode|pass_code|code|key)\s*[:：=]?\s*([A-Za-z0-9]{4,12})/i
-    : /(?:提取码|提取口令|访问码|pwd|passcode|pass_code|password|code|key)\s*[:：=]?\s*([A-Za-z0-9]{4,12})/i
+    ? /(?:提取码|提取口令|访问码|pwd|passcode|pass_code|code|key)\s*[:：=]?\s*([A-Za-z0-9]{2,32})/i
+    : /(?:提取码|提取口令|访问码|pwd|passcode|pass_code|password|code|key)\s*[:：=]?\s*([A-Za-z0-9]{2,32})/i
   const explicit = segment.match(labelPattern)
   if (explicit) return validPassCode(explicit[1])
   if (!archiveContext) {
-    const generic = segment.match(/密[码碼]\s*[:：=]?\s*([A-Za-z0-9]{4,12})/)
+    const generic = segment.match(/密[码碼]\s*[:：=]?\s*([A-Za-z0-9]{2,32})/)
     if (generic) return validPassCode(generic[1])
   }
   if (allowBare) {
-    const bare = segment.match(/[A-Za-z0-9]{4,12}/)
+    const bare = segment.match(/[A-Za-z0-9]{2,32}/)
     if (bare) return validPassCode(bare[0])
   }
   return ''

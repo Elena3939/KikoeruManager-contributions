@@ -303,7 +303,7 @@
                         v-model.trim="row.item.pass_code"
                         class="baidu-pass-code-input"
                         type="text"
-                        maxlength="12"
+                        maxlength="32"
                         placeholder="重新输入提取码"
                         @keyup.enter.stop="applyPassCodeAndPreview(row.item)"
                       >
@@ -633,7 +633,7 @@ function normalizeBaiduShareLine(value) {
     }
   }
   const inline = text.match(
-    /^(https?:\/\/\S+?)\s+(?:提取码|访问码|密码|密碼|pwd|passcode|pass_code|code)?\s*[:：= ]?\s*([A-Za-z0-9]{4,12})\s*$/i,
+    /^(https?:\/\/\S+?)\s+(?:提取码|访问码|密码|密碼|pwd|passcode|pass_code|code)?\s*[:：= ]?\s*([A-Za-z0-9]{2,32})\s*$/i,
   )
   if (inline && isBaiduShareUrl(inline[1])) {
     return appendBaiduPassCode(inline[1].trim(), inline[2].trim())
@@ -654,7 +654,7 @@ function isBaiduShareUrl(value) {
 
 function baiduPassCodeFromText(value) {
   const match = String(value || '').trim().match(
-    /(?:提取码|访问码|密码|密碼|pwd|passcode|pass_code|code)?\s*[:：= ]?\s*([A-Za-z0-9]{4,12})$/i,
+    /(?:提取码|访问码|密码|密碼|pwd|passcode|pass_code|code)?\s*[:：= ]?\s*([A-Za-z0-9]{2,32})$/i,
   )
   return match ? match[1].trim() : ''
 }
@@ -1169,6 +1169,16 @@ function compactBaiduVerificationReason(item) {
   return reason || warning || '需要输入提取码'
 }
 
+function supportsPassCodeEdit(item) {
+  // 百度网盘与 Transfer.it 都支持「补输/改提取码后重新预览」。后端在
+  // requires_pass_code 为真时会带上该标记；百度历史上还额外强制要求
+  // isBaidu，这里一并保留以免回归。
+  if (!item || !item.requires_pass_code) return false
+  if (isBaidu.value) return true
+  const source = sourceKey(item.source || item.download_mode || sourceFromUrl(item.url || item.masked_url || item.share_url || ''))
+  return source === 'transferit'
+}
+
 function isBaiduVerificationFailure(item) {
   if (!isBaidu.value || !item || item.ok) return false
   const source = sourceKey(item.source || item.download_mode || sourceFromUrl(item.url || item.masked_url || ''))
@@ -1327,11 +1337,11 @@ function buildFailedPreviewTreeRoot(item, index) {
     ok: false,
     reason: compactBaiduFailure ? '' : previewItemReason(item),
     warning: compactBaiduFailure ? '' : (item?.warning || ''),
-    passCodeText: !compactBaiduFailure && isBaidu.value && item?.requires_pass_code
+    passCodeText: !compactBaiduFailure && item?.requires_pass_code
       ? (item.pass_code ? `提取码 ${item.pass_code}` : '缺提取码')
       : '',
     passCodeWarn: Boolean(item?.requires_pass_code || item?.pass_code_invalid),
-    passCodeEditable: Boolean(isBaidu.value && item?.requires_pass_code),
+    passCodeEditable: supportsPassCodeEdit(item),
   })
 }
 
@@ -1351,7 +1361,7 @@ function buildBaiduPreviewTreeRoots(item, index) {
       warning: item?.warning || '',
       passCodeText: item?.pass_code ? `提取码 ${item.pass_code}` : '',
       passCodeWarn: Boolean(item?.requires_pass_code || item?.pass_code_invalid),
-      passCodeEditable: Boolean(item?.requires_pass_code),
+      passCodeEditable: supportsPassCodeEdit(item),
     })
     decoratePreviewFileNode(node)
     return [node]
@@ -1386,7 +1396,7 @@ function buildBaiduPreviewTreeRoots(item, index) {
     warning: item?.warning || '',
     passCodeText: item?.pass_code ? `提取码 ${item.pass_code}` : '',
     passCodeWarn: Boolean(item?.requires_pass_code || item?.pass_code_invalid),
-    passCodeEditable: Boolean(item?.requires_pass_code),
+    passCodeEditable: supportsPassCodeEdit(item),
   })
   entries.forEach((entry, entryIndex) => {
     addFilePathToPreviewTree(root, entry.parts, item, entry.file, `${rootKey}:${entryIndex}`, item?.source)
@@ -1456,11 +1466,11 @@ function decoratePreviewFileNode(node) {
   node.size = Number(file?.size_bytes || file?.size || item?.size_bytes || item?.size || 0)
   node.fileCount = node.ok ? 1 : 0
   node.customPreview = customPreviewForTreeRow(node)
-  node.passCodeText = !compactBaiduFailure && isBaidu.value && (item.requires_pass_code || item.pass_code)
+  node.passCodeText = item.requires_pass_code || item.pass_code
     ? (item.pass_code ? `提取码 ${item.pass_code}` : '缺提取码')
     : ''
-  node.passCodeWarn = Boolean(isBaidu.value && (item.requires_pass_code || item.pass_code_invalid))
-  node.passCodeEditable = Boolean(isBaidu.value && item.requires_pass_code)
+  node.passCodeWarn = Boolean(item.requires_pass_code || item.pass_code_invalid)
+  node.passCodeEditable = supportsPassCodeEdit(item)
   node.volumeGroup = null
   return node
 }
@@ -2249,6 +2259,11 @@ function applyPassCodeAndPreview(item) {
   const code = String(item?.pass_code || '').trim()
   const shareUrl = String(item?.share_url || item?.url || item?.masked_url || '').trim()
   if (!shareUrl || !code) return
+  const source = sourceKey(item?.source || item?.download_mode || sourceFromUrl(shareUrl))
+  if (!isBaidu.value && source === 'transferit') {
+    applyTransferitPassCodeAndPreview(item, shareUrl, code)
+    return
+  }
   const lines = String(urlText.value || '').split(/\r?\n/)
   const shareIdentity = baiduShareIdentity(shareUrl)
   const fixedShareUrl = replaceBaiduPassCode(shareUrl, code)
@@ -2276,6 +2291,54 @@ function applyPassCodeAndPreview(item) {
   addPreviewLog('已更新提取码，重新预览该分享', 'warning')
   preview({ forceRefresh: true })
 }
+
+function transferitShareIdentity(value) {
+  try {
+    const parsed = new URL(String(value || '').trim())
+    const parts = parsed.pathname.split('/').filter(Boolean)
+    return parts.length ? `${parsed.hostname.toLowerCase()}/${parts[parts.length - 1]}` : ''
+  } catch {
+    return String(value || '').trim()
+  }
+}
+
+function applyTransferitPassCodeAndPreview(item, shareUrl, code) {
+  const lines = String(urlText.value || '').split(/\r?\n/)
+  const shareIdentity = transferitShareIdentity(shareUrl)
+  let matched = false
+  const nextLines = []
+  for (let index = 0; index < lines.length; index += 1) {
+    const raw = lines[index]
+    const trimmed = raw.trim()
+    // Transfer.it 的提取码在链接里没有标准的 ?pwd= 参数位置（前端解析出的 code
+    // 来自「- 提取码」行），因此这里把「链接行 + 紧随其后的提取码行」整体替换为
+    // 单行可解析文本：`<url> 提取码 <code>`。
+    if (!matched && trimmed && transferitShareIdentity(trimmed.match(/https?:\/\/\S+/)?.[0] || '') === shareIdentity) {
+      const indent = raw.match(/^\s*/)?.[0] || ''
+      nextLines.push(`${indent}${shareUrl} 提取码 ${code}`)
+      if (isHttpPassCodeLine(lines[index + 1])) {
+        index += 1
+      }
+      matched = true
+      continue
+    }
+    nextLines.push(raw)
+  }
+  if (!matched) {
+    nextLines.push(`${shareUrl} 提取码 ${code}`)
+  }
+  urlText.value = nextLines.join('\n')
+  addPreviewLog('已更新提取码，重新预览该分享', 'warning')
+  preview({ forceRefresh: true })
+}
+
+function isHttpPassCodeLine(value) {
+  const trimmed = String(value || '').trim()
+  if (!trimmed) return false
+  if (isBaiduPassCodeLine(trimmed)) return true
+  return /^(?:提取码|提取口令|访问码|密[码碼]|pwd|passcode|pass_code|password|code|key)\s*[:：=]?\s*\S{1,32}$/i.test(trimmed)
+}
+
 
 function syncBaiduCustomNamingPayload(items) {
   return (items || []).map(item => ({
