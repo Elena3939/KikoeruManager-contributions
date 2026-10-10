@@ -2439,6 +2439,59 @@ def test_filter_preview_selection_preserves_source_failure_rows_without_keys():
     assert filtered["items"][0]["reason"] == preview["items"][0]["reason"]
 
 
+def test_gofile_selection_key_stable_across_download_row_shape():
+    """gofile 下载行（download_files）与预览 item 必须算出同一 selection_key。
+
+    回归「没有通过校验的下载项（无明细）」：下载行只有 name/size，且早期版本没有
+    content_id；预览 item 有 filename/size_bytes/content_id。若 key 把 filename/size
+    也算进去，自动重试重建的 key 就会与下载前二次预览不一致，选择过滤全失配。
+    """
+    service = HttpDownloadService()
+    preview_item = {
+        "source": "gofile",
+        "content_id": "file-abc",
+        "share_url": "https://gofile.io/d/XXXXXX",
+        "filename": "RJ01625284.7z.001",
+        "relative_path": "RJ01625284.7z.001",
+        "size_bytes": 1073741824,
+    }
+    # 模拟 download_files 行：字段名不同（name/size），且 content_id 由 B3 补写。
+    download_row = {
+        "source": "gofile",
+        "content_id": "file-abc",
+        "share_url": "https://gofile.io/d/XXXXXX",
+        "name": "RJ01625284.7z.001",
+        "relative_path": "RJ01625284.7z.001",
+        "size": 1073741824,
+    }
+    assert service._preview_item_selection_key(preview_item) == service._preview_item_selection_key(download_row)
+
+
+def test_gofile_selection_key_ignores_filename_and_size_drift():
+    """有 content_id 时，gofile 的 key 不应受 filename / size 漂移影响。"""
+    service = HttpDownloadService()
+    base = {
+        "source": "gofile",
+        "content_id": "file-abc",
+        "share_url": "https://gofile.io/d/XXXXXX",
+        "filename": "a.zip",
+        "relative_path": "a.zip",
+        "size_bytes": 100,
+    }
+    drifted = {**base, "filename": "a.zip", "relative_path": "a.zip", "size_bytes": 100}
+    assert service._preview_item_selection_key(base) == service._preview_item_selection_key(drifted)
+
+
+def test_normalize_retry_source_item_backfills_gofile_content_id():
+    """gofile 重试行缺 content_id 时，应从 file_id / download_file_id 兜底，保证 key 可复现。"""
+    service = HttpDownloadService()
+    row = {"source": "gofile", "file_id": "file-abc", "name": "a.zip", "size": 100, "status": "failed"}
+    normalized = service._normalize_retry_source_item(row)
+    assert normalized["content_id"] == "file-abc"
+    assert normalized["status"] == "pending"
+    assert normalized["progress"] == 0
+
+
 @pytest.mark.asyncio
 async def test_transferit_reparse_keeps_candidates_for_unrecoverable_selection(monkeypatch, tmp_path):
     bind_config(monkeypatch, tmp_path)
@@ -5569,3 +5622,69 @@ async def test_poll_task_refreshes_pikpak_url_failure_in_place(monkeypatch, tmp_
     assert ("aria2.remove", ["gid-old"]) in calls
     assert any(call[0] == "aria2.addUri" for call in calls)
     assert runtime["active_file_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 问题 1：Transfer.it 提取码支持
+# ---------------------------------------------------------------------------
+
+def _transferit_error(code, message=None):
+    """构造一个模拟 transferit-py ``MegaAPIError`` 的轻量异常。"""
+    exc = HttpDownloadError(message or "mega api error")
+    exc.code = code
+    exc.name = "EKEY" if code == -14 else ""
+    return exc
+
+
+def test_transferit_password_state_missing_when_no_password_supplied():
+    service = HttpDownloadService()
+    exc = _transferit_error(-14, "this transfer is password-protected — pass a password")
+    assert service._transferit_password_state(exc, password_supplied=False) == "missing"
+
+
+def test_transferit_password_state_wrong_when_password_supplied():
+    service = HttpDownloadService()
+    exc = _transferit_error(-14, "wrong transfer password")
+    assert service._transferit_password_state(exc, password_supplied=True) == "wrong"
+
+
+def test_transferit_password_state_ignores_unrelated_errors():
+    service = HttpDownloadService()
+    exc = _transferit_error(-3, "server is busy — try again shortly")
+    assert service._transferit_password_state(exc, password_supplied=False) == ""
+
+
+def test_transferit_password_reads_pwd_query_param():
+    """前端把 3 位提取码 AOA 归一化进 ``?pwd=AOA``，后端必须能取到。"""
+    service = HttpDownloadService()
+    assert service._transferit_password("https://transfer.it/t/k7C4An4zWRST?pwd=AOA") == "AOA"
+    assert service._transferit_password("https://transfer.it/t/k7C4An4zWRST?password=AOA") == "AOA"
+    assert service._transferit_password("https://transfer.it/t/k7C4An4zWRST") == ""
+
+
+@pytest.mark.asyncio
+async def test_transferit_preview_marks_missing_password_row(monkeypatch, tmp_path):
+    """缺提取码时，resolve_source_urls 必须产出带 requires_pass_code 的失败行，
+    而不是把裸的 MegaAPIError 文本抛给前端。"""
+    bind_config(monkeypatch, tmp_path)
+    service = HttpDownloadService()
+
+    async def fake_collect(raw_url):
+        raise HttpDownloadError("Transfer.it 分享需要提取码")
+
+    monkeypatch.setattr(service, "_collect_transferit_files", fake_collect)
+    # 让异常被识别为密码类
+    orig_state = service._transferit_password_state
+    monkeypatch.setattr(
+        service,
+        "_transferit_password_state",
+        lambda exc, password_supplied=False: orig_state(exc, password_supplied=password_supplied) or "missing",
+    )
+
+    result = await service.resolve_source_urls(["https://transfer.it/t/k7C4An4zWRST"], materialize=False)
+
+    failed = result.get("failed_items") or []
+    assert len(failed) == 1
+    assert failed[0]["source"] == "transferit"
+    assert failed[0]["requires_pass_code"] is True
+    assert failed[0]["pass_code_invalid"] is False

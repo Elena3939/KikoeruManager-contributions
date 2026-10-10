@@ -967,6 +967,14 @@ class HttpDownloadService:
                 filename_identity = ""
                 relative_path_identity = str(item.get("relative_dir") or "").strip()
                 size_identity = ""
+        elif source == "gofile" and stable_source_id:
+            # gofile 与 pikpak / transferit 同属按文件粒度选择的分享源：只要有稳定的
+            # content_id，就以它为准，剥离 filename / relative_path / size 这些在两次
+            # 解析之间可能漂移的字段。否则下载前的二次预览（带 content_id）与自动重试
+            # 时从 download_files 重建的行会算出不同 key → 选择过滤全失配 → 静默丢弃。
+            filename_identity = ""
+            relative_path_identity = ""
+            size_identity = ""
         parts = [
             source,
             share_url_identity,
@@ -2919,6 +2927,30 @@ class HttpDownloadService:
             "504",
         ))
 
+    def _transferit_password_state(self, exc: BaseException, *, password_supplied: bool) -> str:
+        """判定 Transfer.it 报错是否属于「密码」类问题。
+
+        返回：
+        - ``"missing"``：分享受密码保护，但本次请求没有携带密码（服务端 EKEY = -14 且
+          未提供 pw_token）→ 应引导用户补输提取码，而不是当成解析失败重试三次。
+        - ``"wrong"``：已携带密码但被服务端拒绝（transferit-py 会把这种情况翻译成
+          ``wrong transfer password``）→ 应提示用户改密码。
+        - ``""``：与密码无关。
+
+        注意：transferit-py 对两种情况都用 ``MegaAPIError(code=-14)``，区分手段是
+        是否传入了 ``password``（传入即会派生 ``pw_token``）。
+        """
+        code = getattr(exc, "code", None)
+        name = str(getattr(exc, "name", "") or "").upper()
+        text = self._sanitize_error(exc).lower()
+        if code == -14 or name == "EKEY":
+            return "wrong" if password_supplied else "missing"
+        if "wrong transfer password" in text or "wrong password" in text:
+            return "wrong"
+        if "password-protected" in text or "pass a password" in text:
+            return "missing"
+        return ""
+
     def _transferit_resume_offset(self, tmp_path: Path, total_size: int = 0) -> int:
         try:
             existing = int(tmp_path.stat().st_size)
@@ -3233,6 +3265,15 @@ class HttpDownloadService:
                 last_error = exc
             except Exception as exc:
                 last_error = exc
+                # 密码类错误（缺密码 / 密码错误）不是瞬时故障，重试三次也没有意义，
+                # 只会把「缺提取码」拖成一次无谓的等待并丢失结构化语义。
+                password_state = self._transferit_password_state(exc, password_supplied=bool(password))
+                if password_state:
+                    raise HttpDownloadError(
+                        "Transfer.it 分享需要提取码"
+                        if password_state == "missing"
+                        else "Transfer.it 提取码不正确"
+                    ) from exc
                 if not self._is_transferit_transient_error(exc):
                     raise
             if last_error and self._is_transferit_transient_error(last_error) and metadata_row is None:
@@ -4538,7 +4579,26 @@ class HttpDownloadService:
 
     def _normalize_retry_source_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         normalized = dict(item or {})
-        if str(normalized.get("source") or "").strip().lower() != "pikpak":
+        source = str(normalized.get("source") or "").strip().lower()
+        if source == "gofile":
+            # gofile 重试行来自上一轮 download_files。必须保证选择键所需的稳定字段
+            # 齐全：content_id 缺失时用 file_id / download_file_id 兜底，share_url 保留，
+            # 否则重建出的 selection_key 与下载前二次预览解析出的 key 不一致，
+            # 会导致「没有通过校验的下载项」且无任何明细。
+            if not str(normalized.get("content_id") or "").strip():
+                fallback_id = (
+                    str(normalized.get("file_id") or "").strip()
+                    or str(normalized.get("download_file_id") or "").strip()
+                )
+                if fallback_id:
+                    normalized["content_id"] = fallback_id
+            for key in ("gid", "failure_reason", "error_message"):
+                normalized.pop(key, None)
+            normalized["status"] = "pending"
+            normalized["downloaded"] = 0
+            normalized["progress"] = 0
+            return normalized
+        if source != "pikpak":
             return normalized
         # 转存 ID 和下载直链都属于单轮临时资源。重试必须保留分享源文件 ID，
         # 再从原分享重新转存；不能继续引用用户已手动清理掉的旧转存文件。
@@ -4593,12 +4653,23 @@ class HttpDownloadService:
                     failed.append({"ok": False, "url": raw_url, "masked_url": self._mask_url(raw_url), "reason": "Gofile 分享中没有可下载文件", "source": "gofile"})
                     continue
                 if selection_filter:
-                    files = [
+                    matched_files = [
                         item for item in files
                         if self._share_item_matches_selection("gofile", item, selection_filter)
                     ]
-                    if not files:
+                    if not matched_files:
+                        # 选中项与本次解析结果完全对不上（分享已变更 / 选择键漂移）。
+                        # 绝不能静默丢弃：否则上游 items 与 failed_items 同时为空，
+                        # 只能报出没有任何明细的「没有通过校验的下载项」。
+                        failed.append({
+                            "ok": False,
+                            "url": raw_url,
+                            "masked_url": self._mask_url(raw_url),
+                            "reason": "Gofile 已选文件与分享当前内容不匹配（可能分享已变更或解析结果漂移），请重新预览后重试",
+                            "source": "gofile",
+                        })
                         continue
+                    files = matched_files
                 for item in files:
                     download_url = str(item.get("url") or "")
                     if not download_url:
@@ -4632,12 +4703,21 @@ class HttpDownloadService:
                         failed.append({"ok": False, "url": raw_url, "masked_url": self._mask_url(raw_url), "reason": "Google Drive 文件夹中没有可下载文件", "source": "google_drive"})
                         continue
                     if selection_filter:
-                        files = [
+                        matched_files = [
                             item for item in files
                             if self._share_item_matches_selection("google_drive", item, selection_filter)
                         ]
-                        if not files:
+                        if not matched_files:
+                            # 同 gofile：静默丢弃会让上游只能报「没有通过校验的下载项」而无明细。
+                            failed.append({
+                                "ok": False,
+                                "url": raw_url,
+                                "masked_url": self._mask_url(raw_url),
+                                "reason": "Google Drive 已选文件与文件夹当前内容不匹配（可能已变更或解析结果漂移），请重新预览后重试",
+                                "source": "google_drive",
+                            })
                             continue
+                        files = matched_files
                     for item in files:
                         download_url = str(item.get("url") or "")
                         if not download_url:
@@ -4685,7 +4765,19 @@ class HttpDownloadService:
                         files = selected_files
                 source_items.extend(files)
             except Exception as exc:
-                failed.append({"ok": False, "url": raw_url, "masked_url": self._mask_url(raw_url), "reason": self._sanitize_error(exc), "source": "transferit"})
+                password_state = self._transferit_password_state(exc, password_supplied=bool(self._transferit_password(raw_url)))
+                row: Dict[str, Any] = {
+                    "ok": False,
+                    "url": raw_url,
+                    "masked_url": self._mask_url(raw_url),
+                    "reason": self._sanitize_error(exc),
+                    "source": "transferit",
+                }
+                if password_state:
+                    # 前端据此渲染可编辑的提取码输入框（与百度网盘同一套交互）。
+                    row["requires_pass_code"] = True
+                    row["pass_code_invalid"] = password_state == "wrong"
+                failed.append(row)
 
         pikpak_links = [url for url in urls if self._is_pikpak_url(url)]
         if pikpak_links:
@@ -6596,6 +6688,23 @@ class HttpDownloadService:
                 if reason:
                     reasons.append(f"{target}: {reason}" if target else reason)
             detail = "；".join(reasons)
+            if not detail:
+                # 走到这里说明二次预览一条 ok 项都没有、且没有任何带 reason 的失败行。
+                # 典型成因是分享源（gofile / google_drive 文件夹等）在选择过滤时被静默
+                # 丢弃，导致 items 与 failed_items 同时为空。补一行诊断，避免下次又只看到
+                # 没有明细的报错而无法定位。
+                preview_items = list(preview.get("items") or [])
+                logger.warning(
+                    "[HTTP下载] 二次预览无可下载项且无失败明细 task=%s urls=%s selected_keys=%s "
+                    "selected_items=%s preview_items=%s source_items=%s",
+                    getattr(task, "id", ""),
+                    [self._mask_url(u) for u in raw_urls],
+                    len(list(metadata.get("selected_keys") or [])),
+                    len(selected_items),
+                    len(preview_items),
+                    len(list(preview.get("source_items") or [])),
+                )
+                detail = "分享未解析出可下载项（已选文件可能与分享当前内容不匹配），请重新预览后重试"
             failure_reason = f"没有通过校验的下载项: {detail}" if detail else "没有通过校验的下载项"
             task.task_metadata["download_files"] = []
             task.task_metadata["failed_files"] = [
@@ -6738,6 +6847,11 @@ class HttpDownloadService:
                 "expected_size_bytes": int(item.get("size_bytes") or 0),
                 "file_id": item.get("file_id", ""),
                 "download_file_id": item.get("download_file_id", ""),
+                # gofile 的选择键以 content_id 为首选稳定标识（见 _preview_item_selection_key），
+                # 下载行必须带上它，否则自动重试重建出的 selection_key 与下载前二次预览
+                # 解析出的 key 不一致 → 选择过滤全部失配 → 静默丢弃 → 无明细报错。
+                "content_id": item.get("content_id", ""),
+                "share_url": item.get("share_url", ""),
                 "pikpak_cleanup_file_id": item.get("pikpak_cleanup_file_id", ""),
                 "pikpak_materialized": bool(item.get("pikpak_materialized")),
                 "share_id": item.get("share_id", ""),
