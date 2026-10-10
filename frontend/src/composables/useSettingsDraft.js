@@ -405,6 +405,7 @@ export const defaultConfig = {
     max_retries: 2,
     temperature: 0.1,
     max_tokens: 4096,
+    max_tokens_auto: false,
     overwrite_manual: false,
     use_ai_subtitle_api: false,
     batch_size: 5,

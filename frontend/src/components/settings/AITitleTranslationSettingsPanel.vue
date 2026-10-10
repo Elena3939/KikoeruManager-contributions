@@ -13,8 +13,24 @@
             <SettingsFieldCard label="每批数量">
               <SettingsNumberStepper v-model="cfg.batch_size" :min="1" :max="20" />
             </SettingsFieldCard>
-            <SettingsFieldCard label="输出上限（tokens）" hint="文件级重命名会返回标题与全部文件名的 JSON，上限过低会截断输出导致重命名异常">
-              <SettingsNumberStepper v-model="cfg.max_tokens" :min="200" :max="32768" :step="512" />
+            <SettingsFieldCard label="输出上限（tokens）" hint="文件级重命名会返回标题与全部文件名的 JSON，上限过低会截断输出导致重命名异常；实际请求会自动夹取到运营商支持的最大值，绝不越界">
+              <div class="max-tokens-row">
+                <SettingsNumberStepper
+                  v-model="cfg.max_tokens"
+                  :min="200"
+                  :max="cfg.max_tokens_auto ? (autoLimitDisplay || 200) : 200000"
+                  :step="512"
+                  :disabled="cfg.max_tokens_auto"
+                />
+                <label class="max-tokens-auto">
+                  <input type="checkbox" v-model="cfg.max_tokens_auto">
+                  <span>自动</span>
+                </label>
+              </div>
+              <div class="max-tokens-hint">
+                <template v-if="autoLimitDisplay">运营商上报最大 {{ autoLimitDisplay }} tokens</template>
+                <template v-else>未获取到运营商上限，请求时将按保守值 8192 夹取</template>
+              </div>
             </SettingsFieldCard>
           </div>
         </div>
@@ -118,6 +134,15 @@
             <Zap :size="15" />
             <span>测试连接</span>
           </stateful-button>
+          <button
+            type="button"
+            class="reset-btn"
+            :disabled="!cfg.model || providerLimitLoading"
+            @click="fetchProviderLimit"
+          >
+            <RotateCcw :size="13" />
+            <span>{{ providerLimitLoading ? '获取中…' : '获取运营商上限' }}</span>
+          </button>
           <span v-if="aiTitleTestResult" class="test-result" :class="{ success: aiTitleTestResult.success, fail: !aiTitleTestResult.success }">
             <Check v-if="aiTitleTestResult.success" :size="14" />
             <X v-else :size="14" />
@@ -131,7 +156,8 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
+import { ElMessage } from 'element-plus'
 import { Bot, Zap, Check, X, RotateCcw } from 'lucide-vue-next'
 import SettingsToggleRow from './SettingsToggleRow.vue'
 import SettingsFieldCard from './SettingsFieldCard.vue'
@@ -139,6 +165,7 @@ import SettingsNumberStepper from './SettingsNumberStepper.vue'
 import AnimatedPasswordInput from '../common/AnimatedPasswordInput.vue'
 import StatefulButton from '../ui/stateful-button.vue'
 import { getAIModelPlatformMeta } from '../common/aiModelPlatformMeta'
+import { aiSubtitleMatchApi } from '../../api'
 
 const props = defineProps({
   config: { type: Object, required: true },
@@ -204,6 +231,68 @@ function resetPromptTemplate() {
 
 // 连接测试
 const aiTitleTestResult = ref(null)
+
+// 运营商上报的输出上限（发现式，不硬编码模型名）：由「获取运营商上限」按钮调用
+// /models 填充；发现后用于「自动」模式的展示与实际夹取参考。
+const providerLimitLoading = ref(false)
+const providerMaxOutputTokens = ref(0)
+const providerContextWindow = ref(0)
+const autoLimitDisplay = computed(() => Number(providerMaxOutputTokens.value) > 0 ? providerMaxOutputTokens.value : 0)
+
+function buildProviderRequestConfig() {
+  const reuseSubtitleApi = cfg.value?.use_ai_subtitle_api === true
+  if (reuseSubtitleApi) {
+    return { use_ai_subtitle_api: true, ...(subCfg.value?.ai_subtitle_matching || {}) }
+  }
+  return {
+    model: cfg.value?.model,
+    api_key: cfg.value?.api_key === '********' ? '' : cfg.value?.api_key,
+    api_base: cfg.value?.api_base,
+    api_version: cfg.value?.api_version,
+    organization: cfg.value?.organization,
+    proxy_url: cfg.value?.proxy_url,
+    timeout_seconds: cfg.value?.timeout_seconds,
+  }
+}
+
+async function fetchProviderLimit() {
+  if (providerLimitLoading.value) return
+  providerLimitLoading.value = true
+  try {
+    const result = await aiSubtitleMatchApi.models(buildProviderRequestConfig())
+    if (!result?.success) {
+      throw new Error(result?.error?.title || result?.error?.message || '获取模型列表失败')
+    }
+    const rows = Array.isArray(result.models) ? result.models : []
+    const target = String(cfg.value?.model || '').toLowerCase()
+    const hit = rows.find(row => String(row?.id || row?.value || '').toLowerCase() === target)
+      || rows.find(row => String(row?.value || '').toLowerCase() === target)
+    if (!hit) {
+      throw new Error(`模型列表里没有 ${cfg.value?.model || '(未设置)'}`)
+    }
+    providerMaxOutputTokens.value = Number(hit.max_output_tokens) || 0
+    providerContextWindow.value = Number(hit.context_window) || 0
+    if (providerMaxOutputTokens.value > 0 && cfg.value.max_tokens_auto) {
+      cfg.value.max_tokens = providerMaxOutputTokens.value
+    }
+    if (providerMaxOutputTokens.value > 0) {
+      ElMessage.success(`运营商上报最大输出 ${providerMaxOutputTokens.value} tokens`)
+    } else {
+      ElMessage.warning('运营商未上报输出上限，请求时将按保守值夹取')
+    }
+  } catch (e) {
+    ElMessage.error(e?.message || '获取运营商上限失败')
+  } finally {
+    providerLimitLoading.value = false
+  }
+}
+
+// 打开面板时若选了「自动」，主动发现一次运营商上限。
+onMounted(() => {
+  if (cfg.value?.max_tokens_auto && cfg.value?.model) {
+    fetchProviderLimit()
+  }
+})
 
 async function testAITitleConnection() {
   aiTitleTestResult.value = null
@@ -287,6 +376,37 @@ async function testAITitleConnection() {
 }
 .reset-btn:active {
   transform: scale(0.96);
+}
+.reset-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.reset-btn:disabled:hover {
+  background: transparent;
+  border-color: #d8b4fe;
+}
+
+.max-tokens-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.max-tokens-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.max-tokens-auto input {
+  cursor: pointer;
+}
+.max-tokens-hint {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-muted);
 }
 
 .test-bar {
