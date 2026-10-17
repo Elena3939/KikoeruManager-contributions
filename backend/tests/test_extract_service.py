@@ -2287,6 +2287,108 @@ class TestExtractService:
             extract_service.config.extract.filename_password_sniff_templates = old_templates
             extract_service.config.extract.filename_password_sniff_enabled = old_enabled
 
+    def test_filename_label_password_from_nested_archive_name(self, extract_service, temp_dir):
+        """嵌套内层包名 ``解压码1021`` → 候选密码 1021。"""
+        archive_path = os.path.join(temp_dir, "解压码1021.zip")
+
+        old_enabled = extract_service.config.extract.filename_password_sniff_enabled
+        try:
+            extract_service.config.extract.filename_password_sniff_enabled = True
+            assert extract_service._get_filename_label_passwords(archive_path) == ["1021"]
+        finally:
+            extract_service.config.extract.filename_password_sniff_enabled = old_enabled
+
+    def test_filename_label_password_reads_parent_folder_name(self, extract_service, temp_dir):
+        parent_dir = os.path.join(temp_dir, "解压码0822")
+        os.makedirs(parent_dir, exist_ok=True)
+        archive_path = os.path.join(parent_dir, "里番.zip")
+
+        old_enabled = extract_service.config.extract.filename_password_sniff_enabled
+        try:
+            extract_service.config.extract.filename_password_sniff_enabled = True
+            assert extract_service._get_filename_label_passwords(archive_path) == ["0822"]
+        finally:
+            extract_service.config.extract.filename_password_sniff_enabled = old_enabled
+
+    def test_filename_label_password_ignores_plain_names(self, extract_service, temp_dir):
+        old_enabled = extract_service.config.extract.filename_password_sniff_enabled
+        try:
+            extract_service.config.extract.filename_password_sniff_enabled = True
+            assert extract_service._get_filename_label_passwords(
+                os.path.join(temp_dir, "RJ01667840.zip")
+            ) == []
+            # 只有标签没有值：不能把扩展名当密码
+            assert extract_service._get_filename_label_passwords(
+                os.path.join(temp_dir, "解压码.zip")
+            ) == []
+        finally:
+            extract_service.config.extract.filename_password_sniff_enabled = old_enabled
+
+    def test_filename_label_password_respects_sniff_switch(self, extract_service, temp_dir):
+        archive_path = os.path.join(temp_dir, "解压码1021.zip")
+        old_enabled = extract_service.config.extract.filename_password_sniff_enabled
+        try:
+            extract_service.config.extract.filename_password_sniff_enabled = False
+            assert extract_service._get_filename_label_passwords(archive_path) == []
+        finally:
+            extract_service.config.extract.filename_password_sniff_enabled = old_enabled
+
+    @pytest.mark.asyncio
+    async def test_password_candidates_include_filename_label_without_vault_write(
+        self, extract_service, temp_dir
+    ):
+        """标签密码只进候选池（entry_id=None），不写密码库。"""
+        import app.models.database as db_module
+
+        archive_path = os.path.join(temp_dir, "解压码1021.zip")
+
+        class _FakeQuery:
+            def filter(self, *args, **kwargs):
+                return self
+
+            def all(self):
+                return []
+
+        class _FakeSession:
+            committed = False
+
+            def query(self, *args, **kwargs):
+                return _FakeQuery()
+
+            def commit(self):
+                self.committed = True
+
+            def close(self):
+                pass
+
+        fake_session = _FakeSession()
+        old_enabled = extract_service.config.extract.filename_password_sniff_enabled
+        old_get_db = db_module.get_db
+        try:
+            extract_service.config.extract.filename_password_sniff_enabled = True
+            db_module.get_db = lambda: iter([fake_session])
+
+            candidates = await extract_service._get_password_candidates_for_archive(archive_path)
+        finally:
+            db_module.get_db = old_get_db
+            extract_service.config.extract.filename_password_sniff_enabled = old_enabled
+
+        labeled = [item for item in candidates if item.get("source") == "文件名标签"]
+        assert [item["password"] for item in labeled] == ["1021"]
+        assert labeled[0]["entry_id"] is None
+        assert fake_session.committed is False
+
+    def test_nested_inherited_passwords_keeps_filename_label(self, extract_service):
+        """外层无密码时，标签候选仍要传给内层包继续尝试。"""
+        inherited = extract_service._build_nested_inherited_passwords(
+            None,
+            [
+                {"password": "1021", "source": "文件名标签", "rjcode": None, "filename": "解压码1021.zip", "entry_id": None},
+                {"password": "generic", "source": "密码库-通用", "rjcode": None, "filename": None, "entry_id": "x"},
+            ],
+        )
+        assert inherited == ["1021"]
+
     def test_filename_password_sniff_reads_split_archive_name(self, extract_service, temp_dir):
         """分卷文件名 RJxxxx(password).7z.001 应嗅探括号内密码。"""
         archive_path = os.path.join(temp_dir, "RJ01618696(southplus@adark).7z.001")

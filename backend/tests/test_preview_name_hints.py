@@ -7,6 +7,7 @@ from app.core.preview_name_hints import (
     extract_rj,
     is_complete_volume_group,
     parse_standard_input,
+    password_from_filename_label,
     share_identity,
 )
 
@@ -187,3 +188,60 @@ def test_extract_rj():
     assert extract_rj("[RJ123456] 作品") == "RJ123456"
     assert extract_rj("rj01234567 作品") == "RJ01234567"
     assert extract_rj("没有编号") == ""
+
+
+def test_password_from_filename_label():
+    assert password_from_filename_label("解压码1021") == "1021"
+    assert password_from_filename_label("解压码1021.zip") == "1021"
+    assert password_from_filename_label("解压码：abc123.rar") == "abc123"
+    assert password_from_filename_label("解压码.zip") == ""
+    assert password_from_filename_label("RJ01667840.zip") == ""
+
+
+def test_apply_hints_falls_back_to_filename_label():
+    """线上实际场景：规范行只有提取码，解压码只在文件名里。"""
+    preview = {
+        "items": [
+            {
+                "share_url": URL,
+                "preview_files": [{"name": "解压码1021"}],
+            }
+        ]
+    }
+    hints = {share_identity(URL): {"rj": "RJ01667840", "extract_password": ""}}
+    apply_hints_to_preview(preview, hints, rules=[])
+    row = preview["items"][0]["preview_files"][0]
+    assert row["custom_name"] == "RJ01667840"
+    assert row["custom_extract_password"] == "1021"
+    assert row["name_hint"] == "RJ01667840(1021)"
+
+
+def test_apply_hints_hint_password_beats_filename_label():
+    preview = {
+        "items": [
+            {
+                "share_url": URL,
+                "preview_files": [{"name": "解压码1021.zip"}],
+            }
+        ]
+    }
+    hints = {share_identity(URL): {"rj": "RJ01667840", "extract_password": "abc123"}}
+    apply_hints_to_preview(preview, hints, rules=[])
+    row = preview["items"][0]["preview_files"][0]
+    assert row["custom_extract_password"] == "abc123"
+    assert row["name_hint"] == "RJ01667840(abc123).zip"
+
+
+def test_apply_hints_user_rule_beats_filename_label():
+    preview = {
+        "items": [
+            {
+                "share_url": URL,
+                "preview_files": [{"name": "解压码1021.zip"}],
+            }
+        ]
+    }
+    hints = {share_identity(URL): {"rj": "RJ01667840", "extract_password": ""}}
+    apply_hints_to_preview(preview, hints, rules=[r"解压码(\d+)"])
+    row = preview["items"][0]["preview_files"][0]
+    assert row["custom_extract_password"] == "1021"

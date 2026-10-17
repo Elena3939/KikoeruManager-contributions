@@ -6,8 +6,8 @@
 ; 本文件必须保存为 UTF-8 with BOM，否则 Inno Setup 6 会按系统代码页解析中文。
 
 #define MyAppName "KikoeruManager"
-#define MyAppPublisher "GinatWiki"
-#define MyAppURL "https://github.com/GinatWiki/KikoeruManager"
+#define MyAppPublisher "GiantWiki"
+#define MyAppURL "https://github.com/GiantWiki/KikoeruManager"
 #define MyAppExeName "KikoeruManager.exe"
 ; 与 desktop_app.py 中 SINGLE_INSTANCE_MUTEX_NAME 保持一致，用于检测运行中实例
 #define MyAppMutex "KikoeruManager_SingleInstance_Mutex"

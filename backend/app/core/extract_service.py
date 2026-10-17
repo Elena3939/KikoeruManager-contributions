@@ -45,6 +45,7 @@ from ..core.archive_volume_utils import get_archive_total_size
 from ..core.polyglot_detector import find_embedded_archive
 from ..core.task_engine import Task
 from ..core.password_utils import (
+    extract_labeled_password,
     normalize_filename_value,
     normalize_password_value,
     normalize_rjcode_value,
@@ -6390,6 +6391,34 @@ class ExtractService:
             logger.info("从文件名嗅探到 %s 个候选密码: %s", len(passwords), os.path.basename(archive_path))
         return passwords
 
+    def _get_filename_label_passwords(self, archive_path: str) -> List[str]:
+        """从「解压码XXXX」这类标签式文件名/父目录名里摘密码。
+
+        与 :meth:`_get_filename_sniff_passwords`（模板 ``{name}({password})``）
+        互补：国内网盘更常见的是把密码直接写成标签，且嵌套包内层名就是
+        ``解压码1021``。开关沿用 ``filename_password_sniff_enabled``。
+        """
+        extract_config = getattr(self.config, "extract", None)
+        if not bool(getattr(extract_config, "filename_password_sniff_enabled", False)):
+            return []
+
+        passwords: List[str] = []
+        seen = set()
+        for target in self._get_filename_password_sniff_targets(archive_path):
+            password = extract_labeled_password(target)
+            if not password or password in seen:
+                continue
+            seen.add(password)
+            passwords.append(password)
+
+        if passwords:
+            logger.info(
+                "从文件名标签摘到 %s 个候选密码: %s",
+                len(passwords),
+                os.path.basename(archive_path),
+            )
+        return passwords
+
     @staticmethod
     def _build_nested_inherited_passwords(
         success_password: Optional[str],
@@ -6449,6 +6478,11 @@ class ExtractService:
         try:
             for sniffed_password in self._get_filename_sniff_passwords(archive_path):
                 add_entry(sniffed_password, "文件名嗅探", None, os.path.basename(archive_path), None)
+
+            # 标签式命名（``解压码1021``）：顶层包与嵌套内层包共用本条链路，
+            # 且 entry_id=None —— 只作为候选尝试，不写密码库。
+            for labeled_password in self._get_filename_label_passwords(archive_path):
+                add_entry(labeled_password, "文件名标签", None, os.path.basename(archive_path), None)
 
             if rjcodes:
                 from sqlalchemy import func

@@ -2,13 +2,13 @@
 
 一个面向 DLsite 同人音声库的本地 / 远程一体化工作台。它不是单纯的“解压重命名脚本”，而是把压缩包识别、自动解压、元数据抓取、库存入库、字幕配对、ASMR 补全、DLsite 特典探测、HTTP 外链下载、百度网盘转存、重复冲突处理、任务中心、操作审计和通知模板串成完整业务链路，适合长期维护本地多盘与群晖远程库存。
 
-[![GHCR](https://img.shields.io/badge/ghcr.io-kikoerumanager-2496ED?logo=docker)](https://github.com/GinatWiki/KikoeruManager/pkgs/container/kikoerumanager)
+[![GHCR](https://img.shields.io/badge/ghcr.io-kikoerumanager-2496ED?logo=docker)](https://github.com/GiantWiki/KikoeruManager/pkgs/container/kikoerumanager)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![upstream](https://img.shields.io/badge/upstream-Elena3939%2FKikoeruManager-2496ED?logo=github)](https://github.com/Elena3939/KikoeruManager)
 
 ## 项目来源与协作
 
-本项目最初由 canforgiveher 发起（原 canforgiveher/KikoeruTool，账号被盗后已迁移至本仓库 [GinatWiki/KikoeruManager](https://github.com/GinatWiki/KikoeruManager)）。[Elena3939/KikoeruManager](https://github.com/Elena3939/KikoeruManager) 在原始 KikoeruTool 基础上开发并贡献了大量代码，本项目在保留原项目与上游代码来源的前提下持续合并更新并二次开发。原项目、上游与本仓库在 GitHub 上均为独立仓库：GitHub 不支持把已存在的独立仓库事后转换为 fork，因此本项目不挂 fork 徽章，改用本段落、LICENSE 与提交历史保留来源与署名。
+本项目最初由 canforgiveher 发起（原 canforgiveher/KikoeruTool，账号被盗后已迁移至本仓库 [GiantWiki/KikoeruManager](https://github.com/GiantWiki/KikoeruManager)）。[Elena3939/KikoeruManager](https://github.com/Elena3939/KikoeruManager) 在原始 KikoeruTool 基础上开发并贡献了大量代码，本项目在保留原项目与上游代码来源的前提下持续合并更新并二次开发。原项目、上游与本仓库在 GitHub 上均为独立仓库：GitHub 不支持把已存在的独立仓库事后转换为 fork，因此本项目不挂 fork 徽章，改用本段落、LICENSE 与提交历史保留来源与署名。
 
 本地通过 `upstream` remote 跟踪上游代码：
 
@@ -105,7 +105,7 @@ Windows 本地首次使用建议直接运行：
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/GinatWiki/KikoeruManager.git
+git clone https://github.com/GiantWiki/KikoeruManager.git
 cd KikoeruManager
 
 # 2. 后端（非 Windows 或手动模式需先准备 PostgreSQL）
@@ -130,7 +130,7 @@ npm run dev
 
 ### Windows 桌面版
 
-打包好的 exe 见 [Releases](https://github.com/GinatWiki/KikoeruManager/releases)。发行 zip 已包含 `tools/postgres` 与 `tools/redis` 便携运行环境，下载解压后双击 `KikoeruManager.exe` 即可；首次启动会自动初始化内置 PostgreSQL / Redis 到 `data/postgresql` 与 `data/redis`，并把连接信息写入 `data/config/config.yaml`，无需单独安装数据库。
+打包好的 exe 见 [Releases](https://github.com/GiantWiki/KikoeruManager/releases)。发行 zip 已包含 `tools/postgres` 与 `tools/redis` 便携运行环境，下载解压后双击 `KikoeruManager.exe` 即可；首次启动会自动初始化内置 PostgreSQL / Redis 到 `data/postgresql` 与 `data/redis`，并把连接信息写入 `data/config/config.yaml`，无需单独安装数据库。
 
 如果发行包没有携带 runtime 或只拷贝了单个 exe，首次启动会自动联网下载便携版；也可以通过 `DATABASE_URL` / `KIKOERUMANAGER_REDIS_URL` 指向外部服务。
 
@@ -144,7 +144,7 @@ npm run dev
 
 ```bash
 # 拉取镜像（GHCR）
-docker pull ghcr.io/ginatwiki/kikoerumanager:<版本号>
+docker pull ghcr.io/giantwiki/kikoerumanager:<版本号>
 ```
 
 上游 [Elena3939/KikoeruManager](https://github.com/Elena3939/KikoeruManager) 的镜像仍发布在 `elena39/kikoerumanager`，可作兼容备选。
@@ -154,7 +154,7 @@ docker pull ghcr.io/ginatwiki/kikoerumanager:<版本号>
 ```yaml
 services:
   kikoerumanager:
-    image: ghcr.io/ginatwiki/kikoerumanager:<版本号>
+    image: ghcr.io/giantwiki/kikoerumanager:<版本号>
     container_name: kikoerumanager
     ports:
       - "5555:5555"

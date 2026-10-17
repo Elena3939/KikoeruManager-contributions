@@ -25,6 +25,8 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
+from .password_utils import extract_labeled_password
+
 _PASS_CODE_QUERY_KEYS = ("pwd", "password", "passcode", "pass_code", "code")
 
 # 段分隔符：竖线（含全角）、TAB、前后带空格的连续短横线。
@@ -344,6 +346,18 @@ def _row_name(row: Dict[str, Any]) -> str:
     return str(row.get("name") or row.get("filename") or row.get("remote_name") or "").strip()
 
 
+def password_from_filename_label(filename: str) -> str:
+    """从 ``解压码1021`` 这类标签式文件名里摘密码；没有则空串。
+
+    规范输入行没写解压码段、用户也没配自定义规则时，这是最后一道兜底：
+    否则 RJ 改名照常生效，但预计下载名会缺 ``(1021)``。
+    """
+    try:
+        return extract_labeled_password(filename)
+    except Exception:  # 兜底逻辑不允许影响预览主流程
+        return ""
+
+
 def _assign_custom_name(row: Dict[str, Any], value: str) -> None:
     """显式设置永远优先：已有 custom_name 就不覆盖。"""
     if str(row.get("custom_name") or row.get("custom_filename") or "").strip():
@@ -380,10 +394,16 @@ def apply_hints_to_preview(
         hint_rj = str(hint.get("rj") or "").strip()
 
         # 1) 密码：该分享下每条文件都填（与文件数量、文件名无关）。
+        #    取值优先级：规范输入行的解压码段 ＞ 用户自定义正则 ＞ 文件名标签兜底。
         for row in files:
             if str(row.get("custom_extract_password") or row.get("extract_password") or "").strip():
                 continue
-            password = hint_password or extract_password_by_rules(_row_name(row), rules)
+            row_name = _row_name(row)
+            password = (
+                hint_password
+                or extract_password_by_rules(row_name, rules)
+                or password_from_filename_label(row_name)
+            )
             if password:
                 row["custom_extract_password"] = password
 

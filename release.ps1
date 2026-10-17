@@ -104,7 +104,7 @@ if ($LASTEXITCODE -eq 0) {
   Write-Host "    - Docker 镜像构建 (ghcr.io)" -ForegroundColor White
   Write-Host ""
   Write-Host "  查看进度:" -ForegroundColor White
-  Write-Host "    https://github.com/GinatWiki/KikoeruManager/actions" -ForegroundColor White
+  Write-Host "    https://github.com/GiantWiki/KikoeruManager/actions" -ForegroundColor White
   Write-Host "========================================" -ForegroundColor Green
 } else {
   Write-Host "[错误] 推送失败" -ForegroundColor Red

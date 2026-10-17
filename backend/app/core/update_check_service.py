@@ -1,6 +1,6 @@
 """GitHub 版本更新检测服务。
 
-查询主发布仓库 GinatWiki/KikoeruManager 的最新 Release，与当前运行版本
+查询主发布仓库 GiantWiki/KikoeruManager 的最新 Release，与当前运行版本
 比较，供前端侧边栏版本标签高亮与跳转使用。结果带内存缓存，避免每次
 前端请求都打 GitHub API（未认证限流 60 次/小时）；网络不可达时静默
 降级，不影响正常业务。
@@ -23,7 +23,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-GITHUB_REPO = "GinatWiki/KikoeruManager"
+GITHUB_REPO = "GiantWiki/KikoeruManager"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_HTML_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
 
@@ -38,7 +38,7 @@ _BROWSER_UA = (
 )
 
 _VERSION_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)$")
-# og:url content 可能是相对路径（/GinatWiki/.../releases/tag/vX.Y.Z）或完整 URL
+# og:url content 可能是相对路径（/GiantWiki/.../releases/tag/vX.Y.Z）或完整 URL
 _OG_URL_TAG_RE = re.compile(
     r'<meta[^>]+property="og:url"[^>]+content="[^"]*releases/tag/([A-Za-z0-9][A-Za-z0-9._-]*)"'
 )

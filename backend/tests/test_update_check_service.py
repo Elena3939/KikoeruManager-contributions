@@ -13,10 +13,10 @@ from app.core.update_check_service import (
 HTML_RELEASE_PAGE = """<!DOCTYPE html>
 <html>
 <head>
-  <meta property="og:url" content="/GinatWiki/KikoeruManager/releases/tag/v2.4.54">
-  <meta property="og:title" content="Release v2.4.54 &middot; GinatWiki/KikoeruManager">
+  <meta property="og:url" content="/GiantWiki/KikoeruManager/releases/tag/v2.4.54">
+  <meta property="og:title" content="Release v2.4.54 &middot; GiantWiki/KikoeruManager">
 </head>
-<body><a href="/GinatWiki/KikoeruManager/releases/tag/v2.4.54">v2.4.54</a></body>
+<body><a href="/GiantWiki/KikoeruManager/releases/tag/v2.4.54">v2.4.54</a></body>
 </html>
 """
 
@@ -94,12 +94,12 @@ def test_parse_release_tag_from_html_relative_og_url():
 
 
 def test_parse_release_tag_from_html_absolute_og_url():
-    html = '<meta property="og:url" content="https://github.com/GinatWiki/KikoeruManager/releases/tag/v2.4.55">'
+    html = '<meta property="og:url" content="https://github.com/GiantWiki/KikoeruManager/releases/tag/v2.4.55">'
     assert parse_release_tag_from_html(html) == "v2.4.55"
 
 
 def test_parse_release_tag_from_html_falls_back_to_tag_path():
-    html = '<a href="/GinatWiki/KikoeruManager/releases/tag/v2.4.56">'
+    html = '<a href="/GiantWiki/KikoeruManager/releases/tag/v2.4.56">'
     assert parse_release_tag_from_html(html) == "v2.4.56"
 
 
@@ -121,7 +121,7 @@ async def test_check_for_updates_caches_and_force_bypasses(monkeypatch):
             "latest_version": "2.4.54",
             "latest_tag": "v2.4.54",
             "has_update": is_newer("v2.4.54", current_version),
-            "release_url": "https://github.com/GinatWiki/KikoeruManager/releases/tag/v2.4.54",
+            "release_url": "https://github.com/GiantWiki/KikoeruManager/releases/tag/v2.4.54",
             "checked_at": 0,
         }
 
@@ -202,7 +202,7 @@ async def test_concurrent_checks_coalesce_into_single_fetch(monkeypatch):
                 200,
                 json_data={
                     "tag_name": "v2.4.54",
-                    "html_url": "https://github.com/GinatWiki/KikoeruManager/releases/tag/v2.4.54",
+                    "html_url": "https://github.com/GiantWiki/KikoeruManager/releases/tag/v2.4.54",
                 },
             )
         },

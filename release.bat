@@ -96,7 +96,7 @@ echo    - Windows EXE 构建
 echo    - Docker 镜像构建 (ghcr.io)
 echo.
 echo  查看进度:
-echo    https://github.com/GinatWiki/KikoeruManager/actions
+echo    https://github.com/GiantWiki/KikoeruManager/actions
 echo ========================================
 
 endlocal

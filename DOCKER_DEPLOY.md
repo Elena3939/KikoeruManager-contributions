@@ -57,7 +57,7 @@ cd /mnt/user/appdata/kikoerumanager
 ```yaml
 services:
   kikoerumanager:
-    image: ghcr.io/ginatwiki/kikoerumanager:latest
+    image: ghcr.io/giantwiki/kikoerumanager:latest
     container_name: kikoerumanager
     ports:
       - "5555:5555"
@@ -126,7 +126,7 @@ docker run -d \
   -e POSTGRES_PASSWORD=请改成强密码 \
   --ulimit nofile=65536:65536 \
   --restart unless-stopped \
-  ghcr.io/ginatwiki/kikoerumanager:latest
+  ghcr.io/giantwiki/kikoerumanager:latest
 ```
 
 ---
@@ -138,7 +138,7 @@ docker run -d \
 ### 1. 克隆代码
 
 ```bash
-git clone https://github.com/GinatWiki/KikoeruManager.git
+git clone https://github.com/GiantWiki/KikoeruManager.git
 cd KikoeruManager
 ```
 
@@ -324,7 +324,7 @@ ulimits:
 
 ## 技术支持
 
-- **GitHub Issues**: https://github.com/GinatWiki/KikoeruManager/issues
+- **GitHub Issues**: https://github.com/GiantWiki/KikoeruManager/issues
 - **文档**: 参见项目 README.md
 - **Unraid 论坛**: 在 Unraid 社区论坛搜索 "KikoeruManager"
 
