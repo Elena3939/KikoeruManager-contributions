@@ -412,6 +412,15 @@ class BaiduNetdiskService:
             "preview": copy.deepcopy(preview),
         }
 
+    def refresh_raw_preview_cache(self, cache_key: str, preview: Dict[str, Any]) -> None:
+        """预览后置处理（如名称解析预填）之后刷新缓存。
+
+        `preview_urls` 内部缓存的是未后置的副本；起任务阶段
+        (`baidu_netdisk_start`) 直接从缓存取 raw preview，所以后置修改必须
+        回写一次，否则预览显示了自动密码、起任务却拿不到。
+        """
+        self._cache_raw_preview(cache_key, preview)
+
     def _config_dir(self) -> str:
         cfg = self._config()
         configured = str(getattr(cfg, "config_dir", "") or "").strip()

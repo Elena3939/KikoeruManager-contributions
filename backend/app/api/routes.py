@@ -574,6 +574,8 @@ def _mask_http_downloader_config_for_log(value: dict) -> dict:
         data["pikpak_accounts"] = masked_accounts
     if data.get("gofile_token"):
         data["gofile_token"] = "********"
+    if data.get("download_inbox_token"):
+        data["download_inbox_token"] = "********"
     return data
 
 
@@ -2167,6 +2169,7 @@ app.add_middleware(
 SECURITY_GATE_PUBLIC_API_PATHS = {
     "/api/health",
     "/api/http-download/google-drive/oauth-callback",
+    "/api/download-inbox/push",
     "/api/security-gate/status",
     "/api/security-gate/verify",
 }
@@ -3681,6 +3684,8 @@ def _mask_http_downloader_config(config) -> Optional[dict]:
                 account['encoded_token'] = '********'
     if data.get('gofile_token'):
         data['gofile_token'] = '********'
+    if data.get('download_inbox_token'):
+        data['download_inbox_token'] = '********'
     return data
 
 
@@ -5279,6 +5284,12 @@ async def update_configuration(request: Request):
                     http_data['gofile_token'] = (
                         _read_http_downloader_secret_from_disk('gofile_token')
                         or (current_gofile_token if current_gofile_token != '********' else '')
+                    )
+                if http_data.get('download_inbox_token') == '********' or 'download_inbox_token' not in http_data:
+                    current_inbox_token = getattr(current_cfg.http_downloader, 'download_inbox_token', '')
+                    http_data['download_inbox_token'] = (
+                        _read_http_downloader_secret_from_disk('download_inbox_token')
+                        or (current_inbox_token if current_inbox_token != '********' else '')
                     )
                 for secret_key in ('google_drive_client_secret', 'google_drive_refresh_token'):
                     if http_data.get(secret_key) == '********' or secret_key not in http_data:
@@ -19228,6 +19239,54 @@ def _http_download_urls_from_payload(urls: List[str]) -> list[str]:
 def _baidu_netdisk_urls_from_payload(urls: List[str]) -> list[str]:
     return extract_baidu_urls("\n".join(str(value or "") for value in urls or []))
 
+
+def _preview_name_parse_options():
+    """读取「预览名称解析」配置；任何异常都按关闭处理，绝不影响预览。"""
+    try:
+        extract = getattr(get_config(), "extract", None)
+        enabled = bool(getattr(extract, "preview_name_parse_enabled", True))
+        rules = [
+            str(pattern or "").strip()
+            for pattern in (getattr(extract, "preview_name_parse_rules", None) or [])
+            if str(pattern or "").strip()
+        ]
+        return enabled, rules
+    except Exception:
+        return False, []
+
+
+def _resolve_preview_name_hints(request):
+    """规范输入命中时返回 (urls, hints, rules)，否则 None（调用方走原逻辑）。"""
+    enabled, rules = _preview_name_parse_options()
+    if not enabled:
+        return None
+    try:
+        from ..core.preview_name_hints import parse_standard_input
+
+        parsed = parse_standard_input(_source_text_from_payload(request))
+    except Exception as exc:
+        logger.warning("预览名称解析失败，退回既有识别: %s", sanitize_text_for_log(exc))
+        return None
+    if not parsed:
+        return None
+    urls, hints = parsed
+    return list(urls), dict(hints), rules
+
+
+def _apply_preview_name_hints(preview, standard_input):
+    """把规范输入里的解压密码 / RJ 号写入 raw preview（只填空位，幂等）。"""
+    if not standard_input or not isinstance(preview, dict):
+        return preview
+    _urls, hints, rules = standard_input
+    try:
+        from ..core.preview_name_hints import apply_hints_to_preview
+
+        apply_hints_to_preview(preview, hints, rules=rules)
+    except Exception as exc:
+        logger.warning("写入预览名称提示失败: %s", sanitize_text_for_log(exc))
+    return preview
+
+
 def _import_archive_passwords_from_request(request) -> Dict[str, object]:
     password_import: Dict[str, object] = {"imported": 0, "skipped": 0, "passwords": []}
     try:
@@ -19830,6 +19889,86 @@ async def http_download_google_drive_oauth_token(request: GoogleDriveOAuthTokenR
     )
 
 
+class DownloadInboxPushRequest(BaseModel):
+    provider: str = "baidu"
+    text: str = ""
+    source: str = ""
+    client_id: str = ""
+
+
+class DownloadInboxAckRequest(BaseModel):
+    provider: Optional[str] = None
+    text: str = ""
+
+
+@app.post("/api/download-inbox/push")
+async def download_inbox_push(payload: DownloadInboxPushRequest, request: Request):
+    """外部写入入口（浏览器插件/脚本）。不走门禁 cookie，靠 token 或私网来源校验。"""
+    from ..core.download_inbox_service import get_download_inbox_service
+
+    service = get_download_inbox_service()
+    client_host = request.client.host if request.client else ""
+    ok, status_code, detail = service.authorize_push(
+        client_host,
+        request.headers.get("X-Inbox-Token", ""),
+    )
+    if not ok:
+        logger.warning(
+            "[下载收件箱] 拒绝写入 host=%s source=%s reason=%s",
+            client_host,
+            sanitize_text_for_log(payload.source or ""),
+            detail,
+        )
+        raise HTTPException(status_code=status_code, detail=detail)
+    try:
+        result = service.push(
+            payload.provider,
+            payload.text,
+            source=payload.source,
+            client_id=payload.client_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.info(
+        "[下载收件箱] 接收推送 host=%s provider=%s accepted=%s duplicated=%s total=%s",
+        client_host,
+        payload.provider or "baidu",
+        result.get("accepted"),
+        result.get("duplicated"),
+        result.get("total"),
+    )
+    return result
+
+
+@app.get("/api/download-inbox/pending")
+async def download_inbox_pending(provider: Optional[str] = None):
+    from ..core.download_inbox_service import get_download_inbox_service
+
+    return get_download_inbox_service().pending(provider)
+
+
+@app.post("/api/download-inbox/ack")
+async def download_inbox_ack(payload: DownloadInboxAckRequest):
+    """确认消费：按分享身份移除待处理项；幂等。"""
+    from ..core.download_inbox_service import get_download_inbox_service
+
+    return get_download_inbox_service().ack(payload.text, payload.provider)
+
+
+@app.post("/api/download-inbox/clear")
+async def download_inbox_clear(payload: DownloadInboxAckRequest):
+    from ..core.download_inbox_service import get_download_inbox_service
+
+    return get_download_inbox_service().clear(payload.provider)
+
+
+@app.get("/api/download-inbox/status")
+async def download_inbox_status():
+    from ..core.download_inbox_service import get_download_inbox_service
+
+    return get_download_inbox_service().status()
+
+
 @app.get("/api/http-download/status")
 async def http_download_status(compact: bool = False):
     from ..core.task_engine import TaskType, get_task_engine
@@ -19904,18 +20043,28 @@ async def baidu_netdisk_status(compact: bool = False):
 async def baidu_netdisk_preview(request: BaiduNetdiskPreviewRequest):
     from ..core.baidu_netdisk_service import get_baidu_netdisk_service, sanitize_baidu_netdisk_preview
 
-    urls = _baidu_netdisk_urls_from_payload(request.urls)
+    standard_input = _resolve_preview_name_hints(request)
+    urls = standard_input[0] if standard_input else _baidu_netdisk_urls_from_payload(request.urls)
     if not urls:
         raise HTTPException(status_code=400, detail="至少需要一个百度网盘分享链接")
     if len(urls) > 100:
         raise HTTPException(status_code=400, detail="单次最多预览 100 行链接/提取码")
     try:
-        preview = await get_baidu_netdisk_service().preview_urls(
+        service = get_baidu_netdisk_service()
+        preview = await service.preview_urls(
             urls,
             target_subdir=request.target_subdir,
             conflict_policy=request.conflict_policy,
             output_folder_name=request.output_folder_name,
         )
+        if standard_input:
+            _apply_preview_name_hints(preview, standard_input)
+            # preview_urls 内部缓存的是后置处理前的副本，必须回写一次，
+            # 否则起任务阶段从缓存取到的预览没有自动密码。
+            service.refresh_raw_preview_cache(
+                str(preview.get("raw_preview_cache_key") or ""),
+                preview,
+            )
         payload = sanitize_baidu_netdisk_preview(preview)
         payload["extracted_archive_passwords"] = extract_archive_passwords(_source_text_from_payload(request))
         return payload
@@ -19933,7 +20082,8 @@ async def baidu_netdisk_start(request: BaiduNetdiskStartRequest):
     )
     from ..core.task_engine import Task, TaskType, get_task_engine
 
-    urls = _baidu_netdisk_urls_from_payload(request.urls)
+    standard_input = _resolve_preview_name_hints(request)
+    urls = standard_input[0] if standard_input else _baidu_netdisk_urls_from_payload(request.urls)
     if not urls:
         raise HTTPException(status_code=400, detail="至少需要一个百度网盘分享链接")
     if len(urls) > 100:
@@ -19955,11 +20105,19 @@ async def baidu_netdisk_start(request: BaiduNetdiskStartRequest):
             output_folder_name=request.output_folder_name,
         )
         raw_preview_cache_key = str(preview.get("raw_preview_cache_key") or raw_preview_cache_key)
+    if standard_input:
+        # 缓存未命中而重新 preview_urls 时也走这里，保证起任务一定能拿到自动密码；
+        # 写入后再刷缓存，开始下载后的重试/续传仍能复用。
+        _apply_preview_name_hints(preview, standard_input)
+        service.refresh_raw_preview_cache(raw_preview_cache_key, preview)
     preview = service.filter_preview_selection(
         preview,
         selected_keys=request.selected_keys,
         selected_items=request.selected_items,
     )
+    if standard_input:
+        # filter_preview_selection 可能返回新对象，补一次（幂等，只填空位）。
+        _apply_preview_name_hints(preview, standard_input)
     public_preview = sanitize_baidu_netdisk_preview(preview)
     ok_items = [item for item in preview.get("items") or [] if item.get("ok")]
     if not ok_items:

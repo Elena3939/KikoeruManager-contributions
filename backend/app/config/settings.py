@@ -144,6 +144,14 @@ class ExtractConfig(BaseModel):
         "{name}({password})",
         "{name}（{password}）",
     ])
+    # 预览名称解析：识别输入框里的规范格式行
+    #   RJ01234567 | <分享链接> | 提取码: xywz | 解压码: abc123
+    # 命中后自动填预览行的解压密码与下载名（不命中的行完全走原有识别）。
+    # 关闭后行为与旧版本完全一致。
+    preview_name_parse_enabled: bool = True
+    # 文件名兜底正则：只在「输入没给解压码」时使用，第一条捕获组即密码。
+    # 语法是普通 Python 正则；坏正则会静默跳过，不影响预览。
+    preview_name_parse_rules: list[str] = Field(default_factory=list)
     extract_nested_archives: bool = True  # 是否解压嵌套压缩包
     max_nested_depth: int = 5  # 最大嵌套深度
     # ZIP 文件名编码兜底代码页。解压前会先读中央目录自动嗅探；嗅探不到时才用这里。
@@ -409,6 +417,12 @@ class HttpDownloaderConfig(BaseModel):
     pikpak_download_use_proxy: bool = False
     pikpak_max_concurrent_downloads: int = 6
     pikpak_accounts: List[PikPakAccountConfig] = Field(default_factory=list)
+    # 下载收件箱：外部（浏览器插件/脚本）把规范格式文本推送到软件，前端预览时合并。
+    download_inbox_enabled: bool = False
+    download_inbox_token: str = ""
+    download_inbox_lan_only: bool = True
+    download_inbox_max_items: int = 500
+    download_inbox_ttl_hours: int = 72
 
 
 class BaiduNetdiskConfig(BaseModel):
