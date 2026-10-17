@@ -6419,6 +6419,56 @@ class ExtractService:
             )
         return passwords
 
+    # 扫描包内条目名前的快速预筛关键字：大包动辄数万条目，先做廉价子串判断，
+    # 只有命中才跑完整标签正则（含英文标签，统一转小写比较）。
+    _ENTRY_LABEL_HINTS = ("解压", "解壓", "压缩", "壓縮", "password")
+    _ENTRY_LABEL_PASSWORD_LIMIT = 12
+
+    def _get_archive_entry_label_passwords(self, archive_info: "ArchiveInfo") -> List[str]:
+        """从压缩包**内部条目名**摘取标签式密码（如条目名 ``解压码1021``）。
+
+        7z/zip 用 ``-p`` 打包时默认 ``-mhe=off``：文件头不加密、目录可读，
+        只有条目数据加密。这类包的密码线索既不在压缩包文件名上，也不在密码
+        库里，只写在被加密的条目名上。条目名直接来自压缩包自身，比文件名
+        猜测更权威，因此调用方把它排在候选列表最前。
+
+        头真正加密（``-mhe=on``）时读不到 ``file_list``，本方法返回空，
+        自动退化为原有行为，不影响既有链路。
+        """
+        extract_config = getattr(self.config, "extract", None)
+        if not bool(getattr(extract_config, "filename_password_sniff_enabled", False)):
+            return []
+
+        file_list = getattr(archive_info, "file_list", None) or []
+        passwords: List[str] = []
+        seen = set()
+        for entry in file_list:
+            if len(passwords) >= self._ENTRY_LABEL_PASSWORD_LIMIT:
+                break
+            if isinstance(entry, dict):
+                # 目录条目名同样承载密码（``解压码1021/``），不跳过。
+                name = str(entry.get("name") or "")
+            else:
+                name = str(entry or "")
+            if not name:
+                continue
+            lowered = name.lower()
+            if not any(hint in lowered for hint in self._ENTRY_LABEL_HINTS):
+                continue
+            password = extract_labeled_password(name)
+            if not password or password in seen:
+                continue
+            seen.add(password)
+            passwords.append(password)
+
+        if passwords:
+            logger.info(
+                "从包内条目名摘到 %s 个候选密码: %s",
+                len(passwords),
+                os.path.basename(getattr(archive_info, "path", "") or ""),
+            )
+        return passwords
+
     @staticmethod
     def _build_nested_inherited_passwords(
         success_password: Optional[str],
@@ -8400,6 +8450,27 @@ class ExtractService:
         """尝试解压，返回 (是否成功, 成功使用的密码)"""
         if password_candidates is None:
             password_candidates = await self._get_password_candidates_for_archive(archive_info.path)
+        else:
+            password_candidates = list(password_candidates)
+        # 包内条目名（``解压码1021``）是「头未加密、条目数据加密」这类 7z 的
+        # 唯一权威密码线索：文件名上没有密码，密码库也没有记录。条目名来自
+        # 压缩包自身，因此排在候选最前；entry_id=None，只试不写密码库。
+        entry_label_passwords = self._get_archive_entry_label_passwords(archive_info)
+        if entry_label_passwords:
+            known_passwords = {str(item.get("password") or "") for item in password_candidates}
+            entry_label_candidates = [
+                {
+                    "entry_id": None,
+                    "password": password,
+                    "source": "包内条目名",
+                    "rjcode": None,
+                    "filename": os.path.basename(str(archive_info.path or "")),
+                }
+                for password in entry_label_passwords
+                if password not in known_passwords
+            ]
+            if entry_label_candidates:
+                password_candidates = [*entry_label_candidates, *password_candidates]
         vault_passwords = [item["password"] for item in password_candidates]
         password_source_map = {
             item["password"]: item.get("source")

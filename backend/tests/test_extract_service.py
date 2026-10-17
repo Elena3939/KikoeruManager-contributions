@@ -2389,6 +2389,60 @@ class TestExtractService:
         )
         assert inherited == ["1021"]
 
+    def test_archive_entry_label_passwords_reads_encrypted_entry_names(self, extract_service):
+        """头未加密、条目数据加密的 7z：密码只写在条目名上（解压码1021）。"""
+        old_enabled = extract_service.config.extract.filename_password_sniff_enabled
+        try:
+            extract_service.config.extract.filename_password_sniff_enabled = True
+            archive_info = ArchiveInfo(
+                "/input/RJ01667840.7z",
+                [
+                    {"name": "解压码1024", "size": 100, "is_dir": False},
+                    {"name": "解压码1021", "size": 200, "is_dir": False},
+                    {"name": "解压码1021/sub/track.mp3", "size": 10, "is_dir": False},
+                    {"name": "无解压码说明.txt", "size": 5, "is_dir": False},
+                    {"name": "track01.mp3", "size": 10, "is_dir": False},
+                ],
+                "",
+            )
+            assert extract_service._get_archive_entry_label_passwords(archive_info) == [
+                "1024",
+                "1021",
+            ]
+        finally:
+            extract_service.config.extract.filename_password_sniff_enabled = old_enabled
+
+    def test_archive_entry_label_passwords_respects_sniff_switch(self, extract_service):
+        old_enabled = extract_service.config.extract.filename_password_sniff_enabled
+        try:
+            extract_service.config.extract.filename_password_sniff_enabled = False
+            archive_info = ArchiveInfo(
+                os.path.join("", "RJ01667840.7z"),
+                [{"name": "解压码1021", "size": 200, "is_dir": False}],
+                "",
+            )
+            assert extract_service._get_archive_entry_label_passwords(archive_info) == []
+        finally:
+            extract_service.config.extract.filename_password_sniff_enabled = old_enabled
+
+    def test_archive_entry_label_passwords_handles_missing_file_list(self, extract_service):
+        """头真正加密（-mhe=on）读不到清单时返回空，不抛异常。"""
+        assert extract_service._get_archive_entry_label_passwords(
+            ArchiveInfo(os.path.join("", "RJ01667840.7z"), [], "")
+        ) == []
+        assert extract_service._get_archive_entry_label_passwords(
+            ArchiveInfo(os.path.join("", "RJ01667840.7z"), None, "")
+        ) == []
+
+    def test_entry_label_candidates_rank_before_other_candidates(self, extract_service):
+        """包内条目名候选参与 priority 分组，排在通用密码之前。"""
+        priority, generic = extract_service._split_vault_passwords_by_priority([
+            {"password": "1021", "source": "包内条目名", "entry_id": None, "rjcode": None, "filename": "a.7z"},
+            {"password": "generic", "source": "密码库-通用", "entry_id": "x", "rjcode": None, "filename": None},
+        ])
+        assert priority == ["1021"]
+        assert generic == ["generic"]
+
     def test_filename_password_sniff_reads_split_archive_name(self, extract_service, temp_dir):
         """分卷文件名 RJxxxx(password).7z.001 应嗅探括号内密码。"""
         archive_path = os.path.join(temp_dir, "RJ01618696(southplus@adark).7z.001")

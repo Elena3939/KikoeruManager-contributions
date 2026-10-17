@@ -81,7 +81,25 @@ _LABELED_PASSWORD_TRAILING = "()[]{}<>（）【】《》「」'\"`。，；、,;
 _LABELED_PASSWORD_TOKEN_BLOCKLIST = frozenset({
     "zip", "rar", "7z", "z01", "tar", "gz", "bz2", "xz", "exe", "iso",
     "password", "pass", "pwd", "密码", "解压码", "解压密码", "压缩包", "无", "暂无",
+    # 说明性后缀：``解压码说明.txt`` 里的 ``说明`` 不是密码
+    "说明", "提示", "简介", "信息", "查看", "见", "txt", "md",
 })
+
+# 标签前紧邻否定词时整条跳过：``无解压码说明`` / ``不含解压码`` / ``无需解压密码``。
+_LABELED_PASSWORD_NEGATIONS = (
+    "无",
+    "没",
+    "非",
+    "不",
+    "勿",
+    "未",
+    "不含",
+    "无需",
+    "无须",
+    "不用",
+    "没有",
+    "不要",
+)
 
 _LABELED_PASSWORD_MAX_LENGTH = 64
 
@@ -111,6 +129,14 @@ def extract_labeled_password(text: Optional[str]) -> str:
     if not name:
         return ""
     for match in _LABELED_PASSWORD_RE.finditer(name):
+        # 否定语义（``无解压码说明.txt`` / ``不含解压码``）：标签前紧邻否定词时
+        # 整条跳过，避免把紧随其后的普通词（如 ``说明`` / ``的包``）当成密码。
+        label_start = match.start()
+        label_prefix = name[max(0, label_start - 2):label_start]
+        if label_prefix and any(
+            label_prefix.endswith(negation) for negation in _LABELED_PASSWORD_NEGATIONS
+        ):
+            continue
         value = str(match.group(1) or "")
         next_label = _LABEL_ONLY_RE.search(value)
         if next_label:

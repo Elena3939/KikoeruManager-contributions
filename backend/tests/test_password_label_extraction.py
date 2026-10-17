@@ -53,3 +53,18 @@ def test_rejects_overlong_value():
 
 def test_accepts_unicode_password():
     assert extract_labeled_password("解压码：密码一二三.zip") == "密码一二三"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "无解压码说明.txt",
+        "没有解压码.zip",
+        "不含解压码的包.7z",
+        "解压码说明.txt",
+        "解压码提示.txt",
+    ],
+)
+def test_negated_label_is_not_a_password(text):
+    """「无解压码说明」这类否定/说明性文件名不得把后面的普通词当密码。"""
+    assert extract_labeled_password(text) == ""
