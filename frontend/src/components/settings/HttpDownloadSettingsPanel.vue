@@ -416,6 +416,57 @@
         </div>
       </Transition>
     </Teleport>
+
+    <div class="settings-card">
+      <div class="card-title">下载收件箱（浏览器插件）</div>
+      <div class="field-stack">
+        <SettingsToggleRow
+          v-model="config.http_downloader.download_inbox_enabled"
+          title="启用下载收件箱"
+          subtitle="浏览器插件可把规范格式文本直接推送到软件；进入 ASMR 同步页或切回标签页时自动填入输入框，不用手动复制粘贴。"
+        />
+        <SettingsToggleRow
+          v-model="config.http_downloader.download_inbox_lan_only"
+          title="局域网免令牌"
+          subtitle="开启后同网段设备无需令牌即可写入。若通过反向代理暴露到公网，请关闭此项并配置令牌，否则外网可任意写入。"
+        />
+        <SettingsFieldCard
+          label="访问令牌（可选）"
+          hint="留空时按上面的「局域网免令牌」放行；填写后外部推送必须携带 X-Inbox-Token 请求头。"
+        >
+          <div class="inbox-inline-row">
+            <input
+              v-model="config.http_downloader.download_inbox_token"
+              class="field-input"
+              type="text"
+              placeholder="留空表示不校验令牌"
+              autocomplete="off"
+              spellcheck="false"
+            >
+            <button type="button" class="ghost-inline-btn compact" @click="generateDownloadInboxToken">生成</button>
+            <button type="button" class="ghost-inline-btn compact" :disabled="!config.http_downloader.download_inbox_token" @click="clearDownloadInboxToken">清除</button>
+          </div>
+        </SettingsFieldCard>
+        <SettingsFieldCard
+          label="插件推送地址"
+          hint="填进浏览器插件的服务地址。扩展必须在 background / service worker 中发起请求，content script 会被 CORS 拦截。"
+        >
+          <input class="field-input" type="text" :value="downloadInboxEndpoint" readonly>
+        </SettingsFieldCard>
+        <SettingsFieldCard
+          label="队列状态"
+          hint="推送的条目在点击预览后仍保留，任务创建成功且未整体失败时才自动移除。"
+        >
+          <div class="inbox-inline-row">
+            <span class="inbox-status-text">
+              待处理 {{ inboxStatus?.total ?? 0 }} 条<template v-if="inboxStatus?.providers?.baidu">，百度 {{ inboxStatus.providers.baidu }}</template><template v-if="inboxStatus?.providers?.http">，外链 {{ inboxStatus.providers.http }}</template>
+            </span>
+            <button type="button" class="ghost-inline-btn compact" :disabled="inboxStatusLoading" @click="loadDownloadInboxStatus">刷新</button>
+            <button type="button" class="ghost-inline-btn compact danger" :disabled="inboxClearing || !inboxStatus?.total" @click="clearDownloadInboxQueue">清空</button>
+          </div>
+        </SettingsFieldCard>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -431,7 +482,7 @@ import PikPakStateIcon from './PikPakStateIcon.vue'
 import AppDropdown from '../common/AppDropdown.vue'
 import AnimatedPasswordInput from '../common/AnimatedPasswordInput.vue'
 import { HTTP_DOWNLOAD_PLATFORM_META } from '../common/httpDownloadPlatformMeta'
-import { API_BASE, configApi, httpDownloadApi } from '../../api'
+import { API_BASE, configApi, downloadInboxApi, httpDownloadApi } from '../../api'
 import { showSystemConfirm } from '../../composables/useSystemPrompt'
 
 const props = defineProps({
@@ -1417,10 +1468,86 @@ async function clearAllPikPakTransfers() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 下载收件箱（浏览器插件推送）
+// ---------------------------------------------------------------------------
+const inboxStatus = ref(null)
+const inboxStatusLoading = ref(false)
+const inboxClearing = ref(false)
+
+const downloadInboxEndpoint = computed(() => {
+  const base = String(API_BASE || '').replace(/\/+$/, '')
+  if (/^https?:\/\//i.test(base)) return `${base}/download-inbox/push`
+  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+  return `${origin}${base}/download-inbox/push`
+})
+
+function generateDownloadInboxToken() {
+  const bytes = new Uint8Array(16)
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes)
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256)
+  }
+  props.config.http_downloader.download_inbox_token = Array.from(bytes)
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('')
+  ElMessage.success('已生成新令牌，保存设置后生效')
+}
+
+function clearDownloadInboxToken() {
+  props.config.http_downloader.download_inbox_token = ''
+}
+
+async function loadDownloadInboxStatus() {
+  inboxStatusLoading.value = true
+  try {
+    inboxStatus.value = await downloadInboxApi.status()
+  } catch {
+    inboxStatus.value = null
+  } finally {
+    inboxStatusLoading.value = false
+  }
+}
+
+async function clearDownloadInboxQueue() {
+  if (inboxClearing.value || !inboxStatus.value?.total) return
+  try {
+    await showSystemConfirm({
+      title: '清空下载收件箱',
+      message: '将丢弃所有尚未消费的插件推送条目。',
+      description: '只影响待处理队列，不会删除任何已有下载任务或本地文件。',
+      confirmText: '清空队列',
+      cancelText: '取消',
+      tone: 'danger'
+    })
+  } catch {
+    return
+  }
+  inboxClearing.value = true
+  try {
+    const result = await downloadInboxApi.clear()
+    ElMessage.success(`已清空 ${Number(result?.removed || 0)} 条待处理记录`)
+    await loadDownloadInboxStatus()
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '清空收件箱失败')
+  } finally {
+    inboxClearing.value = false
+  }
+}
+
+watch(
+  () => props.config.http_downloader.download_inbox_enabled,
+  enabled => {
+    if (enabled) loadDownloadInboxStatus()
+  }
+)
+
 onMounted(() => {
   window.addEventListener('message', handleGoogleDriveOAuthMessage)
   loadPikPakCachedStatus()
   notifyGoogleDriveExpired()
+  loadDownloadInboxStatus()
 })
 
 watch(googleDriveOAuthExpired, (expired) => {
@@ -1755,6 +1882,25 @@ onBeforeUnmount(() => {
   color: var(--set-text-muted);
   font-size: 13px;
   text-align: left;
+}
+
+.inbox-inline-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inbox-inline-row .field-input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.inbox-status-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--set-text-muted);
+  font-size: 12.5px;
 }
 
 .http-proxy-trigger-caret {

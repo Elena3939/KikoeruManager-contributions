@@ -3,7 +3,7 @@
     provider="baidu"
     :draft="draft"
     @update:draft="$emit('update:draft', $event)"
-    @started="$emit('started', $event)"
+    @started="(taskIds, meta) => $emit('started', taskIds, meta)"
   />
 </template>
 

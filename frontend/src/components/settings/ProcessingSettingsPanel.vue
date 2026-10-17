@@ -119,6 +119,28 @@
               每行一个模板，必须包含 {password}；例如 RJ01381271(SOUTH+).zip 会由 {name}({password}) 提取 SOUTH+。
             </template>
           </SettingsFieldCard>
+          <SettingsToggleRow
+            v-model="config.extract.preview_name_parse_enabled"
+            title="网盘预览名称解析"
+            subtitle="识别「RJ号 | 链接 | 提取码 | 解压码」规范输入，自动填预览行的解压密码与下载名。"
+          />
+          <SettingsFieldCard v-if="config.extract.preview_name_parse_enabled" label="文件名兜底规则">
+            <textarea
+              v-model="previewNameParseRulesText"
+              class="field-input template-textarea"
+              rows="3"
+              spellcheck="false"
+              placeholder="解压码\s*[:：]?\s*([A-Za-z0-9]+)"
+            />
+            <template #hint>
+              <span>
+                可选，只在输入没写「解压码:」时生效。每行一个 Python 正则，第一条捕获组即密码；
+                例如 <code>解压码\s*[:：]?\s*([A-Za-z0-9@!#$%&amp;*+_.-]+)</code>
+                能从 <code>解压码****.zip</code> 里取出 <code>****</code>。
+              </span>
+              <button type="button" class="inline-text-btn" @click="insertPreviewNameParseExample">插入示例规则</button>
+            </template>
+          </SettingsFieldCard>
           <SettingsToggleRow v-model="config.extract.extract_nested_archives" title="自动解压嵌套压缩包" subtitle="适合复杂包结构，但会增加处理时长。" />
           <SettingsFieldCard v-if="config.extract.extract_nested_archives" label="最大嵌套深度">
             <SettingsRangeStepper v-model="config.extract.max_nested_depth" :min="1" :max="10" />
@@ -282,6 +304,32 @@ const filenamePasswordSniffTemplatesText = computed({
       .filter(Boolean)
   }
 })
+
+const previewNameParseRulesText = computed({
+  get() {
+    const rules = props.config?.extract?.preview_name_parse_rules
+    return Array.isArray(rules) ? rules.join('\n') : ''
+  },
+  set(value) {
+    props.config.extract.preview_name_parse_rules = String(value || '')
+      .split(/\r?\n/)
+      .map(item => item.trim())
+      .filter(Boolean)
+  }
+})
+
+function insertPreviewNameParseExample() {
+  const extract = props.config?.extract
+  if (!extract) return
+  const examples = [
+    String.raw`解压码\s*[:：]?\s*([A-Za-z0-9@!#$%&*+_.-]{3,64})`,
+    String.raw`解压密码\s*[:：]?\s*([A-Za-z0-9@!#$%&*+_.-]{3,64})`,
+  ]
+  const current = Array.isArray(extract.preview_name_parse_rules)
+    ? extract.preview_name_parse_rules
+    : []
+  extract.preview_name_parse_rules = Array.from(new Set([...current, ...examples]))
+}
 
 const subtitlePriorityText = computed({
   get() {
@@ -808,6 +856,27 @@ function formatDurationMs(value) {
 
 :global(html.kikoerumanager-dark) .watcher-memory-hint {
   color: #5eead4;
+}
+
+.inline-text-btn {
+  margin-left: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #2563eb;
+  font: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.inline-text-btn:hover {
+  opacity: 0.75;
+}
+
+:global(html.kikoerumanager-dark) .inline-text-btn {
+  color: #60a5fa;
 }
 
 @media (max-width: 1200px) {

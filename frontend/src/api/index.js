@@ -2285,6 +2285,37 @@ export const baiduNetdiskApi = {
   }
 }
 
+// 下载收件箱：浏览器插件把规范格式文本推送到软件，前端预览时合并进输入框。
+export const downloadInboxApi = {
+  pending: async (provider = '') => {
+    const response = await apiClient.get('/download-inbox/pending', {
+      params: provider ? { provider } : undefined,
+      timeout: 15000
+    })
+    return response.data
+  },
+
+  ack: async (payload = {}) => {
+    const response = await apiClient.post('/download-inbox/ack', {
+      provider: payload.provider || '',
+      text: payload.text || ''
+    }, { timeout: 15000 })
+    return response.data
+  },
+
+  clear: async (provider = '') => {
+    const response = await apiClient.post('/download-inbox/clear', {
+      provider: provider || ''
+    }, { timeout: 15000 })
+    return response.data
+  },
+
+  status: async () => {
+    const response = await apiClient.get('/download-inbox/status', { timeout: 15000 })
+    return response.data
+  }
+}
+
 export const rjSubtitleApi = {
   scan: async (folderPath, options = {}) => {
     const response = await apiClient.post('/rj-subtitle/scan', {

@@ -740,7 +740,7 @@ import {
   ChevronLeft,
   ChevronRight,
 } from 'lucide-vue-next'
-import { asmrSyncApi, baiduNetdiskApi, configApi, httpDownloadApi, libraryApi, taskApi, taskCenterApi } from '../api'
+import { asmrSyncApi, baiduNetdiskApi, configApi, downloadInboxApi, httpDownloadApi, libraryApi, taskApi, taskCenterApi } from '../api'
 import { showSystemConfirm } from '../composables/useSystemPrompt'
 import { useViewport } from '../composables/useViewport'
 import AppLoadingAnimation from '../components/common/AppLoadingAnimation.vue'
@@ -1840,6 +1840,7 @@ async function refreshHttpDownloadWorkbench(options = {}) {
     const stillActive = httpDownloadWorkbenchTasks.value.some(t => ['pending', 'processing', 'paused', 'waiting_retry'].includes(String(t.status || '')))
     if (stillActive) startHttpDownloadWorkbenchPolling()
     else stopHttpDownloadWorkbenchPolling()
+    await settleInboxAck('http', httpDownloadWorkbenchTasks.value)
   } catch (error) {
     if (!httpDownloadWorkbenchRequestGuard.isLatest(requestSeq)) return
     console.error('刷新 HTTP 下载工作台失败:', error)
@@ -1849,9 +1850,139 @@ async function refreshHttpDownloadWorkbench(options = {}) {
   }
 }
 
-async function handleHttpDownloadStarted(taskIds = []) {
+// ---------------------------------------------------------------------------
+// 下载收件箱：浏览器插件把规范格式文本推到服务端，这里负责合并进输入框
+// ---------------------------------------------------------------------------
+const pendingInboxAckQueue = ref([])
+const inboxMergedIdentities = new Set()
+let inboxHydrating = false
+
+const DOWNLOAD_INBOX_PASS_CODE_KEYS = ['pwd', 'password', 'passcode', 'pass_code', 'code']
+
+function inboxUrlIdentity(line) {
+  const text = String(line || '').trim()
+  if (!text) return ''
+  const match = text.match(/https?:\/\/[^\s<>"'|｜]+/i)
+  if (!match) return text.replace(/\s+/g, ' ')
+  try {
+    const parsed = new URL(match[0])
+    DOWNLOAD_INBOX_PASS_CODE_KEYS.forEach(key => parsed.searchParams.delete(key))
+    return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '')
+  } catch (_) {
+    return match[0]
+  }
+}
+
+function appendInboxLinesToDraft(draft, lines) {
+  const current = normalizeDownloadDraft(draft)
+  const seen = new Set(
+    String(current.urlText || '')
+      .split(/\r?\n/)
+      .map(inboxUrlIdentity)
+      .filter(Boolean),
+  )
+  const additions = []
+  for (const line of lines) {
+    const identity = inboxUrlIdentity(line)
+    if (!identity || seen.has(identity)) continue
+    seen.add(identity)
+    additions.push(line)
+  }
+  if (!additions.length) return null
+  return {
+    ...current,
+    urlText: [String(current.urlText || '').trim(), ...additions].filter(Boolean).join('\n'),
+  }
+}
+
+async function hydrateDownloadInbox() {
+  if (inboxHydrating) return
+  inboxHydrating = true
+  try {
+    const result = await downloadInboxApi.pending()
+    const items = Array.isArray(result?.items) ? result.items : []
+    if (!items.length) return
+    const grouped = { baidu: [], http: [] }
+    for (const item of items) {
+      const line = String(item?.line || '').trim()
+      if (!line) continue
+      const identity = inboxUrlIdentity(line)
+      if (!identity || inboxMergedIdentities.has(identity)) continue
+      inboxMergedIdentities.add(identity)
+      grouped[item?.provider === 'http' ? 'http' : 'baidu'].push(line)
+    }
+    const mergedLabels = []
+    if (grouped.baidu.length) {
+      const next = appendInboxLinesToDraft(baiduNetdiskDraft.value, grouped.baidu)
+      if (next) {
+        baiduNetdiskDraft.value = next
+        mergedLabels.push(`百度网盘 ${grouped.baidu.length} 条`)
+      }
+    }
+    if (grouped.http.length) {
+      const next = appendInboxLinesToDraft(httpDownloadDraft.value, grouped.http)
+      if (next) {
+        httpDownloadDraft.value = next
+        mergedLabels.push(`外链 ${grouped.http.length} 条`)
+      }
+    }
+    if (mergedLabels.length) {
+      ElMessage.info(`已接收浏览器插件推送（${mergedLabels.join('、')}），点预览即可`)
+    }
+  } catch (_) {
+    // 收件箱未启用 / 旧版本后端不支持：静默，不打断页面初始化
+  } finally {
+    inboxHydrating = false
+  }
+}
+
+function enqueueInboxAck(provider, taskIds, meta) {
+  const sourceText = String(meta?.sourceText || '').trim()
+  if (!sourceText) return
+  pendingInboxAckQueue.value.push({
+    provider,
+    sourceText,
+    taskIds: (Array.isArray(taskIds) ? taskIds : []).map(id => String(id)),
+  })
+}
+
+async function settleInboxAck(provider, tasks) {
+  if (!pendingInboxAckQueue.value.length) return
+  const statusById = new Map()
+  ;(Array.isArray(tasks) ? tasks : []).forEach(task => {
+    const id = String(task?.task_id || task?.id || '')
+    if (id) statusById.set(id, String(task?.display_status || task?.status || ''))
+  })
+  const remaining = []
+  let acked = 0
+  for (const item of pendingInboxAckQueue.value) {
+    if (item.provider !== provider) {
+      remaining.push(item)
+      continue
+    }
+    if (!item.taskIds.length) continue
+    // 任务整体失败时保留待处理条目，方便用户重试；其余状态（含部分成功）视为已消费
+    if (item.taskIds.some(id => statusById.get(id) === 'failed')) {
+      remaining.push(item)
+      continue
+    }
+    try {
+      await downloadInboxApi.ack({ provider, text: item.sourceText })
+      acked += 1
+    } catch (_) {
+      remaining.push(item)
+    }
+  }
+  pendingInboxAckQueue.value = remaining
+  if (acked) {
+    console.debug(`[下载收件箱] 已确认消费 ${acked} 条待处理记录`)
+  }
+}
+
+async function handleHttpDownloadStarted(taskIds = [], meta = {}) {
   const newTaskIds = Array.isArray(taskIds) ? taskIds.filter(Boolean) : []
   if (!newTaskIds.length) return
+  enqueueInboxAck('http', newTaskIds, meta)
   httpDownloadWorkbenchTaskIds.value = mergeTrackedDownloadTaskIds(
     httpDownloadWorkbenchTaskIds.value,
     newTaskIds,
@@ -2051,6 +2182,7 @@ async function refreshBaiduNetdiskWorkbench(options = {}) {
     const stillActive = baiduNetdiskWorkbenchTasks.value.some(t => ['pending', 'processing', 'paused', 'waiting_retry'].includes(String(t.status || '')))
     if (stillActive) startBaiduNetdiskWorkbenchPolling()
     else stopBaiduNetdiskWorkbenchPolling()
+    await settleInboxAck('baidu', baiduNetdiskWorkbenchTasks.value)
   } catch (error) {
     if (!baiduNetdiskWorkbenchRequestGuard.isLatest(requestSeq)) return
     console.error('刷新百度网盘下载工作台失败:', error)
@@ -2060,9 +2192,10 @@ async function refreshBaiduNetdiskWorkbench(options = {}) {
   }
 }
 
-async function handleBaiduNetdiskStarted(taskIds = []) {
+async function handleBaiduNetdiskStarted(taskIds = [], meta = {}) {
   const newTaskIds = Array.isArray(taskIds) ? taskIds.filter(Boolean) : []
   if (!newTaskIds.length) return
+  enqueueInboxAck('baidu', newTaskIds, meta)
   baiduNetdiskWorkbenchTaskIds.value = mergeTrackedDownloadTaskIds(
     baiduNetdiskWorkbenchTaskIds.value,
     newTaskIds,
@@ -2875,6 +3008,7 @@ function handleASMRSyncVisibilityChange () {
   if (!asmrSyncViewActive || (typeof document !== 'undefined' && document.hidden)) return
   statusFailureCount = 0
   refreshStatus()
+  hydrateDownloadInbox()
   if (!statusInterval) startStatusPolling()
 }
 
@@ -2894,6 +3028,7 @@ async function initializeASMRSyncPage () {
   if (subtitleFolder.value) {
     await scanFolder(true)
   }
+  await hydrateDownloadInbox()
   asmrSyncInitialized = true
 }
 
@@ -2917,6 +3052,7 @@ onActivated(async () => {
   if (baiduNetdiskWorkbenchTaskIds.value.length) refreshBaiduNetdiskWorkbench()
   activeWorkspaceTab.value = normalizeWorkspaceTab(route.query?.tab)
   startStatusPolling()
+  hydrateDownloadInbox()
 })
 
 onDeactivated(() => {

@@ -125,6 +125,10 @@ export const defaultConfig = {
     password_list: [],
     filename_password_sniff_enabled: true,
     filename_password_sniff_templates: ['{name}({password})', '{name}（{password}）'],
+    // 预览名称解析：识别「RJ号 | 链接 | 提取码 | 解压码」规范输入，
+    // 自动填预览行的解压密码与下载名。不命中的输入完全走原有识别。
+    preview_name_parse_enabled: true,
+    preview_name_parse_rules: [],
     extract_nested_archives: true,
     max_nested_depth: 5,
     zip_encoding: 932,
@@ -282,7 +286,12 @@ export const defaultConfig = {
     pikpak_device_id: '',
     pikpak_transfer_dir: '/KikoeruManager',
     pikpak_auto_save_share: true,
-    pikpak_accounts: []
+    pikpak_accounts: [],
+    download_inbox_enabled: false,
+    download_inbox_token: '',
+    download_inbox_lan_only: true,
+    download_inbox_max_items: 500,
+    download_inbox_ttl_hours: 72
   },
   baidu_netdisk: {
     enabled: false,

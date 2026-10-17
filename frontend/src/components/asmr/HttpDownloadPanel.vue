@@ -342,6 +342,14 @@
             <span>重命名</span>
           </button>
           <button
+            v-if="canUseSuggestedRjRename"
+            type="button"
+            @click="useSuggestedRjRename"
+          >
+            <Tag :size="13" :stroke-width="2.4" />
+            <span>使用 {{ suggestedRjForTreeRow(previewContextMenu.row) }} 重命名</span>
+          </button>
+          <button
             type="button"
             :disabled="!canSetPasswordPreviewContextRow"
             @click="setPasswordPreviewContextRow"
@@ -370,7 +378,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { AlertTriangle, Check, ChevronRight, CloudDownload, Download, FileIcon, Folder, Globe2, KeyRound, Loader2, PencilLine, RefreshCw, Search, X } from 'lucide-vue-next'
+import { AlertTriangle, Check, ChevronRight, CloudDownload, Download, FileIcon, Folder, Globe2, KeyRound, Loader2, PencilLine, RefreshCw, Search, Tag, X } from 'lucide-vue-next'
 import AppDropdown from '../common/AppDropdown.vue'
 import AppLoadingAnimation from '../common/AppLoadingAnimation.vue'
 import StatefulButton from '../ui/stateful-button.vue'
@@ -388,7 +396,7 @@ import {
 } from './httpDownloadInput.js'
 
 const DOWNLOAD_PANEL_CONFLICT_POLICIES = ['resume', 'rename', 'skip']
-const DOWNLOAD_PREVIEW_CACHE_VERSION = 4
+const DOWNLOAD_PREVIEW_CACHE_VERSION = 5
 const DOWNLOAD_PREVIEW_CACHE_TTL_MS = 30 * 60 * 1000
 const DOWNLOAD_PREVIEW_CACHE_SESSION_ID = getDownloadPreviewCacheSessionId()
 
@@ -617,7 +625,26 @@ const parsedUrls = computed(() => {
   return isBaidu.value ? normalizeBaiduInputRows(rows) : normalizeHttpDownloadInputRows(rows)
 })
 function normalizeBaiduInputRows(rows) {
-  return extractBaiduShareUrls(rows)
+  return extractBaiduShareUrls((rows || []).map(normalizeBaiduStructuredLine))
+}
+
+// 规范格式（RJ | 链接 | 提取码: x | 解压码: y）先切段，只把干净链接 + 提取码交给旧解析，
+// 否则「无 pwd 链接 + 解压码段」会被裸串兜底当成 ?pwd=解压码。
+const BAIDU_STRUCTURED_SEPARATOR_RE = /\s*[|｜]\s*|\t+|\s+-{3,}\s+/
+const BAIDU_PASS_CODE_LABEL_RE = /^(?:提取码|提取口令|访问码|pwd|passcode|pass_code)\s*[:：=]/i
+
+function normalizeBaiduStructuredLine(value) {
+  const text = String(value || '').trim()
+  if (!text || !/[|｜\t]/.test(text)) return text
+  const segments = text.split(BAIDU_STRUCTURED_SEPARATOR_RE).map(item => item.trim()).filter(Boolean)
+  if (segments.length < 2) return text
+  const urlSegment = segments.find(item => isBaiduShareUrl(item))
+  if (!urlSegment) return text
+  const passSegment = segments.find(item => BAIDU_PASS_CODE_LABEL_RE.test(item))
+  const code = passSegment
+    ? baiduPassCodeFromText(passSegment.replace(/^[^:：=]*[:：=]\s*/, ''))
+    : ''
+  return code ? appendBaiduPassCode(urlSegment, code) : urlSegment
 }
 
 function normalizeBaiduShareLine(value) {
@@ -819,6 +846,7 @@ const previewTreeRows = computed(() => flattenPreviewTreeRows(previewTreeRoots.v
 const canRefreshPreviewContextRow = computed(() => Boolean(previewContextMenu.row) && !previewing.value)
 const canRenamePreviewContextRow = computed(() => canRenamePreviewTreeRow(previewContextMenu.row))
 const canSetPasswordPreviewContextRow = computed(() => canSetPasswordPreviewTreeRow(previewContextMenu.row))
+const canUseSuggestedRjRename = computed(() => Boolean(suggestedRjForTreeRow(previewContextMenu.row)))
 
 const previewStatusTitle = computed(() => {
   if (previewing.value) return '生成预览中'
@@ -987,10 +1015,12 @@ async function start() {
   if (!selectedOkCount.value) return ElMessage.warning('先勾选至少一个下载项')
   starting.value = true
   const startedAtMs = Date.now()
+  // 快照：clearStartedInputUrls 会改写 urlText，收件箱 ack 必须用启动那一刻的原文
+  const startedSourceText = String(urlText.value || '')
   try {
     addPreviewLog(`提交 ${selectedOkCount.value} 个选中下载项`)
     const result = await activeApi.value.start({
-      sourceText: urlText.value,
+      sourceText: startedSourceText,
       urls: parsedUrls.value,
       targetSubdir: targetSubdir.value,
       outputFolderName: outputFolderName.value,
@@ -1000,7 +1030,7 @@ async function start() {
       selectedItems: syncBaiduCustomNamingPayload(selectedOkItems.value)
     })
     const ids = (result.tasks || []).map(item => item.task_id || item.id).filter(Boolean)
-    emit('started', ids)
+    emit('started', ids, { sourceText: startedSourceText })
     previewNeedsMaterialize.value = false
     addPreviewLog(result.message || `${panelTitle.value}任务已创建`, 'success')
     ElMessage.success(result.message || `${panelTitle.value}任务已创建`)
@@ -1017,7 +1047,7 @@ async function start() {
       try {
         const recoveredIds = await recoverStartedTasksAfterTimeout(startedAtMs)
         if (recoveredIds.length) {
-          emit('started', recoveredIds)
+          emit('started', recoveredIds, { sourceText: startedSourceText })
           previewNeedsMaterialize.value = false
           addPreviewLog(`请求超时，但已接回 ${recoveredIds.length} 个已创建任务`, 'warning')
           ElMessage.warning('请求超时，但任务已创建，已打开下载工作台')
@@ -1775,6 +1805,13 @@ function isContinuousVolumeEntries(entries) {
   return true
 }
 
+function passwordFromNameHint(hint) {
+  const text = String(hint || '').trim()
+  if (!text) return ''
+  const match = text.match(/\(([^()]+)\)(?=\.[A-Za-z0-9.]+$|$)/)
+  return match ? match[1] : ''
+}
+
 function customPreviewForTreeRow(row) {
   if (!row?.ok) return ''
   if (row.isDir) {
@@ -1783,14 +1820,23 @@ function customPreviewForTreeRow(row) {
     const item = first?.row?.item || row.item
     const customName = String(item?.custom_name || '').trim()
     const customPassword = String(item?.custom_extract_password || '').trim()
-    if (!customName && !customPassword) return ''
+    // 服务端 sanitize 会剥掉 custom_extract_password，分卷组没有本地密码时
+    // 从服务端下发的 name_hint 里取回「(密码)」用于展示。
+    const hintPassword = customPassword ? '' : passwordFromNameHint(first?.row?.file?.name_hint)
+    const displayPassword = customPassword || hintPassword
+    if (!customName && !displayPassword) return ''
     const base = customName || row.volumeGroup.base || row.name
-    return `${base}${customPassword ? `(${customPassword})` : ''}${volumeGroupDisplayPattern(row.volumeGroup)}`
+    return `${base}${displayPassword ? `(${displayPassword})` : ''}${volumeGroupDisplayPattern(row.volumeGroup)}`
   }
   const item = row.item || {}
   const file = row.file || item
+  const localPassword = String(file.custom_extract_password || item.custom_extract_password || '').trim()
+  const serverHint = String(file.name_hint || item.name_hint || '').trim()
+  // 服务端已算好「原件名 + (密码) + 扩展名」，但它不把密码下发给前端；
+  // 用户手动改过密码（本地有值）时仍走下面的实时计算，保证输入即时可见。
+  if (serverHint && !localPassword) return serverHint
   const customName = String(file.custom_name || item.custom_name || '').trim()
-  const customPassword = String(file.custom_extract_password || item.custom_extract_password || '').trim()
+  const customPassword = localPassword
   if (!customName && !customPassword) return ''
   const sourceName = String(file.name || file.filename || item.filename || row.name || '')
   const sourceParts = splitFilename(sourceName)
@@ -1834,6 +1880,13 @@ function canRenamePreviewTreeRow(row) {
   if (!row?.ok) return false
   if (!row.isDir) return true
   return Boolean(row.volumeGroup)
+}
+
+function suggestedRjForTreeRow(row) {
+  if (!row || row.isDir) return ''
+  const item = row.item || {}
+  const file = row.file || {}
+  return String(file.rj_name_suggested || item.rj_name_suggested || '').trim()
 }
 
 function canSetPasswordPreviewTreeRow(row) {
@@ -1894,6 +1947,17 @@ async function renamePreviewContextRow() {
     applyTreeRowRename(row, nextName)
     persistPreviewCacheFromState()
   } catch (_) {}
+}
+
+function useSuggestedRjRename() {
+  const row = previewContextMenu.row
+  const rj = suggestedRjForTreeRow(row)
+  closePreviewContextMenu()
+  if (!row || !rj) return
+  // 多文件分享不自动改名（服务端只下发 rj_name_suggested），由用户手动选择套用。
+  applyTreeRowRename(row, rj)
+  persistPreviewCacheFromState()
+  addPreviewLog(`已套用 ${rj} 作为下载名称`, 'success')
 }
 
 async function setPasswordPreviewContextRow() {
