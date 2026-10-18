@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -515,7 +516,10 @@ def test_delete_materialization_removes_mask_and_duplicate_delivery_is_noop(
         db.close()
 
 
-def test_reconcile_materializes_current_filesystem_state(mutation_env, monkeypatch, tmp_path):
+@pytest.mark.parametrize("heartbeat_after_commit", [False, True])
+def test_reconcile_materializes_current_filesystem_state(
+    mutation_env, monkeypatch, tmp_path, heartbeat_after_commit
+):
     env = mutation_env
     library_id = "reconcile-lib"
     root = tmp_path / "library"
@@ -548,6 +552,27 @@ def test_reconcile_materializes_current_filesystem_state(mutation_env, monkeypat
     )
     assert env.store.get_entry(library_id, "incoming/current.txt") is None
 
+    if heartbeat_after_commit:
+        heartbeat_checked = threading.Event()
+        original_renew = env.service._renew_materializer_lease
+        original_reconcile = env.service._reconcile_path
+
+        def tracked_renew(*args, **kwargs):
+            result = original_renew(*args, **kwargs)
+            heartbeat_checked.set()
+            return result
+
+        def reconcile_then_wait(*args, **kwargs):
+            result = original_reconcile(*args, **kwargs)
+            heartbeat_checked.clear()
+            assert heartbeat_checked.wait(2)
+            time.sleep(0.05)
+            return result
+
+        monkeypatch.setattr(mutation_module, "HEARTBEAT_SECONDS", 0.02)
+        monkeypatch.setattr(env.service, "_renew_materializer_lease", tracked_renew)
+        monkeypatch.setattr(env.service, "_reconcile_path", reconcile_then_wait)
+
     assert env.service._process_next(library_id) is True
     current = env.store.get_entry(library_id, "incoming/current.txt")
     assert current is not None
@@ -569,6 +594,88 @@ def test_reconcile_materializes_current_filesystem_state(mutation_env, monkeypat
         assert status.materialized_seq == 1
         assert status.total_entries == 2
         assert status.total_size_bytes == len(b"current-content")
+        assert status.catchup_error is None
+        ledger = db.query(LibraryIndexMutationLedger).filter_by(
+            library_id=library_id, seq=1
+        ).one()
+        assert ledger.applied_at is not None
+        assert ledger.attempt_count == 0
+        assert ledger.error is None
+        assert ledger.next_retry_at is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "changed_field,changed_value",
+    [
+        (None, None),
+        ("materializer_owner", "another-worker"),
+        ("materializer_epoch", 999),
+        ("active_generation", 999),
+        ("materialized_seq", 3),
+    ],
+)
+def test_completed_heartbeat_still_checks_fence(
+    mutation_env, changed_field, changed_value
+):
+    env = mutation_env
+    library_id = "completed-heartbeat-lib"
+    _prepare_and_finalize(
+        env.service,
+        library_id=library_id,
+        idempotency_key="completed-heartbeat",
+        effect={"kind": "delete", "relative_path": "gone.txt", "scope": "exact"},
+    )
+    assert env.service._process_next(library_id) is True
+    db = env.Session()
+    try:
+        status = db.query(LibraryIndexStatus).filter_by(library_id=library_id).one()
+        epoch = status.materializer_epoch
+        generation = status.active_generation
+        if changed_field:
+            setattr(status, changed_field, changed_value)
+            db.commit()
+    finally:
+        db.close()
+
+    assert env.service._renew_materializer_lease(
+        library_id, epoch=epoch, generation=generation, expected_seq=1
+    ) is (changed_field is None)
+
+
+def test_failure_after_commit_does_not_poison_applied_ledger(mutation_env):
+    env = mutation_env
+    library_id = "completed-failure-lib"
+    _prepare_and_finalize(
+        env.service,
+        library_id=library_id,
+        idempotency_key="completed-failure",
+        effect={"kind": "delete", "relative_path": "gone.txt", "scope": "exact"},
+    )
+    assert env.service._process_next(library_id) is True
+    db = env.Session()
+    try:
+        status = db.query(LibraryIndexStatus).filter_by(library_id=library_id).one()
+        ledger = db.query(LibraryIndexMutationLedger).filter_by(library_id=library_id).one()
+        epoch = status.materializer_epoch
+        ledger_id = ledger.id
+    finally:
+        db.close()
+
+    env.service._record_failure(
+        library_id, 1, ledger_id, epoch, RuntimeError("提交后的异常")
+    )
+    db = env.Session()
+    try:
+        status = db.query(LibraryIndexStatus).filter_by(library_id=library_id).one()
+        ledger = db.query(LibraryIndexMutationLedger).filter_by(id=ledger_id).one()
+        assert status.catchup_state == "idle"
+        assert status.catchup_error is None
+        assert ledger.applied_at is not None
+        assert ledger.attempt_count == 0
+        assert ledger.error is None
+        assert ledger.next_retry_at is None
     finally:
         db.close()
 

@@ -147,10 +147,26 @@ class _InventoryEventHandler(FileSystemEventHandler):
     def on_any_event(self, event) -> None:
         if getattr(event, "event_type", "") in {"opened", "closed", "closed_no_write"}:
             return
+        # watchdog 为目录创建/移动合成后代事件；父目录事件已覆盖整棵子树。
+        if getattr(event, "is_synthetic", False) and getattr(event, "event_type", "") in {
+            "created", "moved",
+        }:
+            return
+        # 子项创建、删除、移动会附带父目录 modified；递归监听已收到子项事件，
+        # 不能再把父目录归并成 subtree，否则移动一个作品会重扫整个社团。
+        if (
+            getattr(event, "event_type", "") == "modified"
+            and getattr(event, "is_directory", False)
+        ):
+            return
         paths = [getattr(event, "src_path", None), getattr(event, "dest_path", None)]
         for path in paths:
             if path:
-                self.owner.mark_dirty(self.library_id, self.root_path, str(path))
+                self.owner.mark_dirty(
+                    self.library_id,
+                    self.root_path,
+                    str(path),
+                )
 
     def on_error(self, _event) -> None:
         self.owner.request_generation_recovery(
@@ -163,6 +179,11 @@ class _InventoryEventHandler(FileSystemEventHandler):
 class LibraryIndexWatcherDriver:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._startup_thread: Optional[threading.Thread] = None
+        self._startup_done = threading.Event()
+        self._startup_done.set()
+        self._startup_state = "stopped"
         self._dirty: dict[str, dict[str, _DirtyPath]] = {}
         self._roots: dict[str, str] = {}
         self._observers: list[Observer] = []
@@ -183,22 +204,67 @@ class LibraryIndexWatcherDriver:
         self._last_start_errno: Optional[int] = None
         self._inotify_limits = _read_inotify_limits()
 
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
+    def start(self, *, background: bool = False) -> None:
+        with self._lifecycle_lock:
+            if not self._startup_done.is_set() or (self._thread and self._thread.is_alive()):
+                return
+            self._stop_event.clear()
+            self._startup_done.clear()
+            self._startup_state = "starting"
+            if background:
+                self._startup_thread = threading.Thread(
+                    target=self._initialize_background,
+                    name="library-index-watcher-startup",
+                    daemon=True,
+                )
+                try:
+                    self._startup_thread.start()
+                except Exception as exc:
+                    self._startup_state = "failed"
+                    self._watcher_mode = "start_failed"
+                    self._last_start_error = str(exc)
+                    self._last_start_errno = getattr(exc, "errno", None)
+                    self._startup_done.set()
+                    raise
+                return
+        self._initialize()
+
+    def _initialize_background(self) -> None:
+        try:
+            self._initialize()
+        except Exception:
+            logger.exception("[索引 watcher] 后台初始化失败")
+
+    def _initialize(self) -> None:
+        try:
+            self._initialize_observers()
+        except Exception as exc:
+            self._stop_observers(self._observers)
+            self._observers = []
+            self._startup_state = "failed" if not self._stop_event.is_set() else "stopped"
+            self._watcher_mode = "start_failed" if not self._stop_event.is_set() else "stopped"
+            self._last_start_error = str(exc)
+            self._last_start_errno = getattr(exc, "errno", None)
+            raise
+        finally:
+            self._startup_done.set()
+
+    def _initialize_observers(self) -> None:
         from ..library_manager import get_library_manager
 
-        self._stop_event.clear()
         self._watcher_mode = "watchdog"
         self._last_start_error = None
         self._last_start_errno = None
         self._inotify_limits = _read_inotify_limits()
-        self._roots.clear()
+        with self._lock:
+            self._roots.clear()
         manager = get_library_manager()
         observers: list[Observer] = []
         try:
             skipped_unwatched = 0
             for item in manager.list_libraries():
+                if self._stop_event.is_set():
+                    break
                 if str(item.get("type") or "") != "local":
                     continue
                 # 只有显式开启「监视此库存」的库存才挂实时 observer；默认不监视，
@@ -211,15 +277,17 @@ class LibraryIndexWatcherDriver:
                 root_path = os.path.abspath(str(item.get("root_path") or item.get("path") or ""))
                 if not library_id or not os.path.isdir(root_path):
                     continue
-                self._roots[library_id] = root_path
+                with self._lock:
+                    self._roots[library_id] = root_path
                 self._restore_redis_dirty(library_id, root_path)
+                if self._stop_event.is_set():
+                    break
                 observer = Observer()
-                observer.schedule(
-                    _InventoryEventHandler(self, library_id, root_path),
-                    root_path,
-                    recursive=True,
-                )
+                handler = _InventoryEventHandler(self, library_id, root_path)
+                # 一个库存只创建一个 inotify emitter；逐目录 schedule 会为每个目录
+                # 创建独立 inotify 实例，目录多时会直接撞上 max_user_instances。
                 observers.append(observer)
+                observer.schedule(handler, root_path, recursive=True)
                 observer.start()
             if skipped_unwatched:
                 logger.info(
@@ -244,13 +312,23 @@ class LibraryIndexWatcherDriver:
                 self._last_start_error,
             )
             observers = []
-        self._observers = observers
-        self._thread = threading.Thread(
-            target=self._run,
-            name="library-index-watcher-dispatch",
-            daemon=True,
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            cancelled = self._stop_event.is_set()
+            if not cancelled:
+                self._observers = observers
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="library-index-watcher-dispatch",
+                    daemon=True,
+                )
+                self._thread.start()
+                self._startup_state = "ready"
+        if cancelled:
+            # observer.start 可能仍在系统调用内；它返回后必须回收，不能重新发布。
+            self._stop_observers(observers)
+            self._watcher_mode = "stopped"
+            self._startup_state = "stopped"
+            return
         logger.info(
             "[索引 watcher] 已启动 mode=%s local_libraries=%s observed_libraries=%s roots=%s",
             self._watcher_mode,
@@ -273,13 +351,21 @@ class LibraryIndexWatcherDriver:
                 logger.debug("[索引 watcher] observer.join 失败", exc_info=True)
 
     def stop(self, timeout: float = 5.0) -> None:
-        self._stop_event.set()
-        self._wake_event.set()
-        self._stop_observers(self._observers, timeout=timeout)
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=max(0.1, timeout))
-        self._observers.clear()
-        self._watcher_mode = "stopped"
+        with self._lifecycle_lock:
+            self._stop_event.set()
+            self._wake_event.set()
+            self._startup_state = "stopping"
+            observers = self._observers
+            self._observers = []
+            thread = self._thread
+        self._stop_observers(observers, timeout=timeout)
+        self._startup_done.wait(timeout=max(0.1, timeout))
+        if thread and thread.is_alive():
+            thread.join(timeout=max(0.1, timeout))
+        with self._lifecycle_lock:
+            if self._stop_event.is_set() and self._startup_done.is_set() and not (thread and thread.is_alive()):
+                self._watcher_mode = "stopped"
+                self._startup_state = "stopped"
 
     def _restore_redis_dirty(self, library_id: str, root_path: str) -> None:
         try:
@@ -309,7 +395,12 @@ class LibraryIndexWatcherDriver:
                 bucket.setdefault(absolute_path, _DirtyPath(first_at=now, last_at=now))
             self._roots[library_id] = root_path
 
-    def mark_dirty(self, library_id: str, root_path: str, absolute_path: str) -> None:
+    def mark_dirty(
+        self,
+        library_id: str,
+        root_path: str,
+        absolute_path: str,
+    ) -> None:
         """watchdog 回调入口：不 stat、不扫盘、不触碰数据库。"""
         relative_path = ""
         try:
@@ -669,6 +760,7 @@ class LibraryIndexWatcherDriver:
         return {
             "running": bool(self._thread and self._thread.is_alive()),
             "watcher_mode": self._watcher_mode,
+            "startup_state": self._startup_state,
             "live_events_available": bool(self._observers),
             "scrub_fallback_running": bool(
                 self._watcher_mode == "inotify_limit"
@@ -705,16 +797,7 @@ def get_library_index_watcher_driver() -> LibraryIndexWatcherDriver:
 
 
 def start_library_index_watcher_driver() -> None:
-    """后台启动库存索引 watcher，避免 inotify 递归 os.walk 阻塞启动事件循环。"""
-    with _driver_start_lock:
-        driver = get_library_index_watcher_driver()
-        if driver._thread and driver._thread.is_alive():
-            return
-        threading.Thread(
-            target=driver.start,
-            name="library-index-watcher-start",
-            daemon=True,
-        ).start()
+    get_library_index_watcher_driver().start(background=True)
 
 
 def stop_library_index_watcher_driver() -> None:
