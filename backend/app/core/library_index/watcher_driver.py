@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 QUIET_SECONDS = 0.75
 MAX_WAIT_SECONDS = 5.0
 MAX_DIRTY_PATHS = 20000
+MAX_WATCH_DEPTH = 2
 # 同一父目录下积压多少条 dirty 才折叠成父目录做一次子树扫描。
 # 解压 / 下载会在短时间内批量写盘，不折叠的话每个文件各派发一次
 # 单文件 reconcile，外加父目录整树重扫，全是重复劳动。
@@ -166,6 +167,7 @@ class _InventoryEventHandler(FileSystemEventHandler):
                     self.library_id,
                     self.root_path,
                     str(path),
+                    coalesce=not getattr(event, "is_directory", False),
                 )
 
     def on_error(self, _event) -> None:
@@ -367,6 +369,25 @@ class LibraryIndexWatcherDriver:
                 self._watcher_mode = "stopped"
                 self._startup_state = "stopped"
 
+    @staticmethod
+    def _coalesce_event_path(root_path: str, absolute_path: str) -> str:
+        """把深层文件事件归并到前两层目录，避免一次上传产生海量 dirty path。"""
+        try:
+            normalized_root = os.path.abspath(root_path)
+            normalized_path = os.path.abspath(absolute_path)
+            if os.path.normcase(
+                os.path.commonpath([normalized_root, normalized_path])
+            ) != os.path.normcase(normalized_root):
+                return normalized_path
+            relative = os.path.relpath(normalized_path, normalized_root)
+            parts = [] if relative == "." else relative.split(os.sep)
+            if len(parts) > MAX_WATCH_DEPTH:
+                return os.path.join(normalized_root, *parts[:MAX_WATCH_DEPTH])
+            return normalized_path
+        except (OSError, ValueError):
+            return absolute_path
+
+
     def _restore_redis_dirty(self, library_id: str, root_path: str) -> None:
         try:
             rows = get_redis_service().read_library_index_dirty_paths_sync(library_id)
@@ -400,6 +421,8 @@ class LibraryIndexWatcherDriver:
         library_id: str,
         root_path: str,
         absolute_path: str,
+        *,
+        coalesce: bool = False,
     ) -> None:
         """watchdog 回调入口：不 stat、不扫盘、不触碰数据库。"""
         relative_path = ""
@@ -427,6 +450,11 @@ class LibraryIndexWatcherDriver:
                 return
         except Exception:
             logger.debug("[索引 watcher] prepared scope 判定失败", exc_info=True)
+        # 先按真实路径识别应用自身的变更，再合并外部文件事件；
+        # 目录事件保留实际子树，避免遮罩和重扫无关兄弟目录。
+        if coalesce:
+            normalized = self._coalesce_event_path(root_path, normalized)
+            relative_path = os.path.relpath(normalized, root_path).replace("\\", "/")
         now = time.monotonic()
         overflowed = False
         with self._lock:
@@ -700,9 +728,11 @@ class LibraryIndexWatcherDriver:
                         is_dir,
                         None if is_dir and ignore_directory_stats else int(stat_result.st_size or 0),
                         None if is_dir and ignore_directory_stats else int(stat_result.st_mtime_ns or 0),
+                        int(getattr(stat_result, "st_dev", 0) or 0),
+                        int(getattr(stat_result, "st_ino", 0) or 0),
                     ))
                 except OSError:
-                    rows.append((entry.name, None, None, None))
+                    rows.append((entry.name, None, None, None, None, None))
         return tuple(sorted(rows, key=lambda item: str(item[0]).casefold()))
 
     def _scrub_once(self) -> None:

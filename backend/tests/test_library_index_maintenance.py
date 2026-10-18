@@ -129,6 +129,8 @@ def test_staging_maintenance_uses_actual_changed_rows(changes):
     writer.chunk_size = 5000
     # 十万条扫描结果只有少量变化时，不应全表维护；删除也计入变化量。
     results = [{"total_entries": 100000}, *sum(([count, 0] if count else [0] for count in changes), [])]
+    if any(changes):
+        results.append(None)
     writer._execute_write = Mock(side_effect=results)
 
     result = writer.finish()

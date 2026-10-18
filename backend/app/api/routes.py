@@ -12322,12 +12322,43 @@ async def notify_library_browser_index_move_batch(request: Request):
         raise HTTPException(status_code=500, detail=f"调度库存索引移动失败: {str(e)}")
 
 
+@app.post("/api/library/browser/index-delete-batch")
+async def notify_library_browser_index_delete_batch(request: Request):
+    try:
+        data = await request.json()
+        library_id = str(data.get("library_id") or "").strip()
+        deleted_paths = data.get("deleted_paths") or []
+        if not library_id or not isinstance(deleted_paths, list) or not deleted_paths:
+            raise HTTPException(status_code=400, detail="缺少库存 ID 或索引删除项")
+        manager = get_library_manager()
+        library = manager.get_library_definition(library_id)
+        paths = []
+        scopes = {}
+        for item in deleted_paths:
+            item = item if isinstance(item, dict) else {"path": item}
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+            paths.append(path)
+            scopes[os.path.normcase(os.path.abspath(path))] = str(item.get("scope") or "exact")
+        result = manager._notify_index_self_mutation_delete_batch(
+            library, paths, sync=False, scopes_by_path=scopes,
+        )
+        return result or {"submitted": False, "submitted_count": 0, "total_count": len(paths)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("调度库存索引删除失败: %s", sanitize_text_for_log(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=f"调度库存索引删除失败: {str(e)}")
+
+
 @app.post("/api/library/browser/delete")
 async def delete_library_browser_item(request: Request):
     path = ""
     library_id = None
     skip_activity_log = False
     batch_id = ""
+    skip_index_mutation = False
     try:
         data = await request.json()
         path = str(data.get("path") or "").strip()
@@ -12335,6 +12366,7 @@ async def delete_library_browser_item(request: Request):
         confirmed = data.get("confirmed", False)
         skip_activity_log = bool(data.get("skip_activity_log"))
         batch_id = str(data.get("batch_id") or "").strip()
+        skip_index_mutation = bool(data.get("skip_index_mutation"))
         if not path:
             raise HTTPException(status_code=400, detail="缺少路径")
         manager = get_library_manager()
@@ -12346,7 +12378,7 @@ async def delete_library_browser_item(request: Request):
         library = manager.get_library_definition(library_id)
         prepared = None
         mutation_effect = None
-        if confirmed and library.type == "local":
+        if confirmed and library.type == "local" and not skip_index_mutation:
             service = get_library_index_mutation_service()
             mutation_effect = {
                 "kind": "delete",
@@ -12368,7 +12400,7 @@ async def delete_library_browser_item(request: Request):
                 library_id,
                 path,
                 confirmed=confirmed,
-                skip_index_mutation=prepared is not None,
+                skip_index_mutation=skip_index_mutation or prepared is not None,
             )
             if confirmed:
                 _invalidate_rj_subtitle_folder_summary_cache(library_id)
@@ -12461,6 +12493,7 @@ async def batch_delete_library_browser_items(request: Request):
         library_id = data.get("library_id")
         confirmed = data.get("confirmed", False)
         skip_activity_log = bool(data.get("skip_activity_log"))
+        skip_index_mutation = bool(data.get("skip_index_mutation"))
         batch_id = str(data.get("batch_id") or "").strip()
         known_items = data.get("known_items") if isinstance(data.get("known_items"), list) else []
         if not paths:
@@ -12469,7 +12502,7 @@ async def batch_delete_library_browser_items(request: Request):
         library = manager.get_library_definition(library_id)
         prepared = None
         planned_effects = []
-        if confirmed and library.type == "local":
+        if confirmed and library.type == "local" and not skip_index_mutation:
             planned_effects = [
                 {
                     "kind": "delete",
@@ -12494,7 +12527,7 @@ async def batch_delete_library_browser_items(request: Request):
                 library_id,
                 paths,
                 confirmed=confirmed,
-                skip_index_mutation=prepared is not None,
+                skip_index_mutation=skip_index_mutation or prepared is not None,
             )
             if confirmed and int((result or {}).get("success_count") or 0) > 0:
                 _invalidate_rj_subtitle_folder_summary_cache(library_id)
@@ -12623,6 +12656,7 @@ async def batch_delete_library_browser_targets(request: Request):
     targets: list[dict[str, Any]] = []
     skip_activity_log = False
     batch_id = ""
+    skip_index_mutation = False
     try:
         data = await request.json()
         raw_targets = data.get("targets") if isinstance(data.get("targets"), list) else []
@@ -12636,6 +12670,7 @@ async def batch_delete_library_browser_targets(request: Request):
         confirmed = data.get("confirmed", False)
         skip_activity_log = bool(data.get("skip_activity_log"))
         batch_id = str(data.get("batch_id") or "").strip()
+        skip_index_mutation = bool(data.get("skip_index_mutation"))
         known_items = data.get("known_items") if isinstance(data.get("known_items"), list) else []
         if not targets:
             raise HTTPException(status_code=400, detail="路径列表不能为空")
@@ -12658,7 +12693,7 @@ async def batch_delete_library_browser_targets(request: Request):
                 key = (library.id, os.path.normcase(os.path.abspath(path)))
                 planned_effects_by_target[key] = effect
                 planned_by_library.setdefault(library.id, []).append(effect)
-            if planned_by_library:
+            if planned_by_library and not skip_index_mutation:
                 mutation_service = get_library_index_mutation_service()
                 prepared = mutation_service.prepare(
                     kind="batch_delete_targets",
@@ -12674,7 +12709,7 @@ async def batch_delete_library_browser_targets(request: Request):
             result = await manager.batch_delete_targets(
                 targets,
                 confirmed=confirmed,
-                skip_index_mutation=prepared is not None,
+                skip_index_mutation=skip_index_mutation or prepared is not None,
             )
             if confirmed:
                 for item in list((result or {}).get("success_paths") or []):
@@ -12689,6 +12724,40 @@ async def batch_delete_library_browser_targets(request: Request):
             result["index_mutation_queued"] = int(result.get("success_count") or 0) > 0
             if batch_id:
                 result["batch_id"] = batch_id
+            if skip_index_mutation:
+                queued_by_library: dict[str, list[dict[str, Any]]] = {}
+                for item in success_targets:
+                    if not isinstance(item, dict):
+                        continue
+                    library_id = str(item.get("library_id") or "").strip()
+                    path = str(item.get("path") or "").strip()
+                    if not library_id or not path:
+                        continue
+                    effect = planned_effects_by_target.get(
+                        (library_id, os.path.normcase(os.path.abspath(path)))
+                    )
+                    if effect is None:
+                        continue
+                    queued_by_library.setdefault(library_id, []).append({
+                        "path": path,
+                        "scope": effect.get("scope") or "exact",
+                    })
+                queued_count = 0
+                for library_id, deleted_paths in queued_by_library.items():
+                    library = manager.get_library_definition(library_id)
+                    queued = manager._notify_index_self_mutation_delete_batch(
+                        library,
+                        [item["path"] for item in deleted_paths],
+                        sync=False,
+                        scopes_by_path={
+                            os.path.normcase(os.path.abspath(item["path"])): item["scope"]
+                            for item in deleted_paths
+                        },
+                    )
+                    if isinstance(queued, dict):
+                        queued_count += int(queued.get("queued_count") or queued.get("total_count") or 0)
+                result["index_mutation_queued"] = queued_count > 0
+                result["index_mutation_queued_count"] = queued_count
             try:
                 from ..core.activity_log_service import log_api_delete_action, log_batch_api_delete_result
                 if not skip_activity_log:
@@ -13239,9 +13308,42 @@ async def _auto_circle_group_by_path(
             "message": f"将移动到 {target_circle_dir}",
         }
 
+    mutation_service = None
+    prepared = None
+    planned_scope = "subtree"
+    planned_target_path = os.path.join(target_circle_dir, os.path.basename(abs_row_path))
+    if library.type == "local":
+        mutation_service = get_library_index_mutation_service()
+        planned_effects = [
+            {
+                "kind": "move",
+                "relative_path": _local_relative_path(library, abs_row_path),
+                "scope": planned_scope,
+                "target_library_id": library.id,
+                "target_path": _local_relative_path(library, planned_target_path),
+            },
+            {
+                "kind": "reconcile",
+                "relative_path": _local_relative_path(library, planned_target_path),
+                "scope": planned_scope,
+            },
+        ]
+        prepared = mutation_service.prepare(
+            kind="auto_circle_group",
+            effects_by_library={library.id: planned_effects},
+            idempotency_key=f"auto-circle:{uuid.uuid4().hex}",
+        )
+        replay = _prepared_replay_response(prepared)
+        if replay is not None:
+            return replay
+
     try:
+        if prepared is not None:
+            mutation_service.mark_filesystem_started(prepared.operation_id)
         os.makedirs(target_circle_dir, exist_ok=True)
     except OSError as exc:
+        if prepared is not None:
+            mutation_service.fail_prepared(prepared.operation_id, exc)
         raise HTTPException(status_code=500, detail=f"创建社团目录失败: {exc}")
 
     try:
@@ -13251,10 +13353,15 @@ async def _auto_circle_group_by_path(
             paths=[abs_row_path],
             target_path=target_circle_dir,
             conflict_strategy="suffix",
+            skip_index_mutation=prepared is not None,
         )
-    except HTTPException:
+    except HTTPException as exc:
+        if prepared is not None:
+            mutation_service.fail_prepared(prepared.operation_id, exc)
         raise
     except Exception as exc:
+        if prepared is not None:
+            mutation_service.fail_prepared(prepared.operation_id, exc)
         logger.error("[auto-circle-group][%s] 移动失败: %s", rjcode, exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"移动失败: {exc}")
 
@@ -13262,6 +13369,46 @@ async def _auto_circle_group_by_path(
     moved = (result or {}).get("moved") or []
     if moved:
         final_path = str((moved[0] or {}).get("destination") or "")
+
+    if prepared is not None:
+        actual_path = final_path or planned_target_path
+        actual_effects = [
+            {
+                "kind": "move",
+                "relative_path": _local_relative_path(library, abs_row_path),
+                "scope": planned_scope,
+                "target_library_id": library.id,
+                "target_path": _local_relative_path(library, actual_path),
+            },
+            {
+                "kind": "reconcile",
+                "relative_path": _local_relative_path(library, actual_path),
+                "scope": planned_scope,
+            },
+        ] if moved else []
+        try:
+            result = mutation_service.finalize(
+                prepared.operation_id,
+                actual_effects_by_library={library.id: actual_effects},
+                actual_result=result,
+            )
+        except Exception as exc:
+            mutation_service.mark_reconcile_required(prepared.operation_id, exc)
+            return {
+                "success": True,
+                "rjcode": rjcode,
+                "circle_name": circle_name,
+                "safe_circle_name": safe_circle_name,
+                "target_dir": target_circle_dir,
+                "final_path": final_path or planned_target_path,
+                "message": f"已移动到《{safe_circle_name}》，索引正在后台校正",
+                "result": {
+                    **(result or {}),
+                    "operation_id": prepared.operation_id,
+                    "operation_state": "reconcile_required",
+                    "reconciliation_pending": True,
+                },
+            }
 
     return {
         "success": True,
@@ -13866,8 +14013,61 @@ async def rename_library_file(request: Request):
         library = manager.get_library_definition(library_id) if library_id else manager.find_local_library_for_path(old_path)
         if library is None:
             raise HTTPException(status_code=403, detail="只能重命名库存内的文件")
-
-        result = await manager.rename(library.id, old_path, new_name)
+        mutation_service = None
+        prepared = None
+        planned_effects: list[dict[str, Any]] = []
+        if getattr(library, "type", None) == "local":
+            mutation_service = get_library_index_mutation_service()
+            scope = "subtree" if os.path.isdir(old_path) else "exact"
+            relative_old = _local_relative_path(library, old_path)
+            relative_new = _local_relative_path(library, os.path.join(os.path.dirname(old_path), new_name))
+            planned_effects = [{
+                "kind": "move",
+                "relative_path": relative_old,
+                "scope": scope,
+                "target_library_id": library.id,
+                "target_path": relative_new,
+            }, {
+                "kind": "reconcile",
+                "relative_path": relative_new,
+                "scope": scope,
+            }]
+            prepared = mutation_service.prepare(
+                kind="rename",
+                effects_by_library={library.id: planned_effects},
+                idempotency_key=_request_idempotency_key(request),
+            )
+            replay = _prepared_replay_response(prepared)
+            if replay is not None:
+                return replay
+            mutation_service.mark_filesystem_started(prepared.operation_id)
+        try:
+            rename_kwargs = {}
+            if prepared is not None:
+                rename_kwargs.update(skip_index_mutation=True, sync_index_mutation=False)
+            result = await manager.rename(library.id, old_path, new_name, **rename_kwargs)
+        except Exception as exc:
+            if prepared is not None:
+                mutation_service.fail_prepared(prepared.operation_id, exc)
+            raise
+        if prepared is not None:
+            try:
+                result = mutation_service.finalize(
+                    prepared.operation_id,
+                    actual_effects_by_library={library.id: planned_effects},
+                    actual_result=result,
+                )
+            except Exception as exc:
+                mutation_service.mark_reconcile_required(prepared.operation_id, exc)
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        **result,
+                        "operation_id": prepared.operation_id,
+                        "operation_state": "reconcile_required",
+                        "reconciliation_pending": True,
+                    },
+                )
         _invalidate_rj_subtitle_folder_summary_cache(library.id)
         logger.info("重命名成功: library=%s %s -> %s", library.id, old_path, result.get("new_path"))
         return result
@@ -14325,6 +14525,8 @@ def _is_path_under_base(path: str, base_path: str) -> bool:
 @app.post("/api/library/delete")
 async def delete_library_file(request: Request):
     """删除库内文件或文件夹（需要确认）"""
+    prepared = None
+    mutation_service = None
     try:
         data = await request.json()
         file_path = str(data.get("path") or "").strip()
@@ -14339,7 +14541,51 @@ async def delete_library_file(request: Request):
         if library is None:
             raise HTTPException(status_code=403, detail="只能删除库存内的文件")
 
-        result = await manager.delete(library.id, file_path, confirmed=bool(confirmed))
+        if confirmed and getattr(library, "type", None) == "local":
+            mutation_service = get_library_index_mutation_service()
+            effect = {
+                "kind": "delete",
+                "relative_path": _local_relative_path(library, file_path),
+                "scope": "subtree" if os.path.isdir(file_path) else "exact",
+            }
+            prepared = mutation_service.prepare(
+                kind="delete",
+                effects_by_library={library.id: [effect]},
+                idempotency_key=_request_idempotency_key(request),
+            )
+            replay = _prepared_replay_response(prepared)
+            if replay is not None:
+                return replay
+            mutation_service.mark_filesystem_started(prepared.operation_id)
+
+        try:
+            delete_kwargs = {"confirmed": bool(confirmed)}
+            if prepared is not None:
+                delete_kwargs["skip_index_mutation"] = True
+            result = await manager.delete(library.id, file_path, **delete_kwargs)
+        except Exception as exc:
+            if prepared is not None:
+                mutation_service.fail_prepared(prepared.operation_id, exc)
+            raise
+
+        if prepared is not None:
+            try:
+                result = mutation_service.finalize(
+                    prepared.operation_id,
+                    actual_effects_by_library={library.id: [effect]},
+                    actual_result=result,
+                )
+            except Exception as exc:
+                mutation_service.mark_reconcile_required(prepared.operation_id, exc)
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        **result,
+                        "operation_id": prepared.operation_id,
+                        "operation_state": "reconcile_required",
+                        "reconciliation_pending": True,
+                    },
+                )
         if confirmed:
             _invalidate_rj_subtitle_folder_summary_cache(library.id)
         logger.info("删除接口完成: library=%s path=%s confirmed=%s", library.id, file_path, bool(confirmed))
@@ -14386,35 +14632,106 @@ async def batch_delete_library_items(request: Request):
                 "size_disabled": size_disabled,
             }
 
+        planned_effects_by_library: dict[str, list[dict[str, Any]]] = {}
+        for group in grouped.values():
+            library = group["library"]
+            if getattr(library, "type", None) != "local":
+                continue
+            planned_effects_by_library[library.id] = [
+                {
+                    "kind": "delete",
+                    "relative_path": _local_relative_path(library, path),
+                    "scope": "subtree" if os.path.isdir(path) else "exact",
+                }
+                for path in group["paths"]
+            ]
+
+        mutation_service = None
+        prepared = None
+        if planned_effects_by_library:
+            mutation_service = get_library_index_mutation_service()
+            prepared = mutation_service.prepare(
+                kind="batch_delete",
+                effects_by_library=planned_effects_by_library,
+                idempotency_key=_request_idempotency_key(request),
+            )
+            replay = _prepared_replay_response(prepared)
+            if replay is not None:
+                return replay
+            mutation_service.mark_filesystem_started(prepared.operation_id)
+
         success_count = 0
         failed_paths: list[dict[str, str]] = []
         success_paths: list[str] = []
+        actual_effects_by_library: dict[str, list[dict[str, Any]]] = {}
         for group in grouped.values():
+            library = group["library"]
             try:
-                result = await manager.batch_delete(group["library"].id, group["paths"], confirmed=True)
+                batch_delete_kwargs = {"confirmed": True}
+                if prepared is not None and getattr(library, "type", None) == "local":
+                    batch_delete_kwargs["skip_index_mutation"] = True
+                result = await manager.batch_delete(library.id, group["paths"], **batch_delete_kwargs)
                 group_failed = result.get("failed_paths") or []
                 failed_lookup = {
-                    str((item or {}).get("path") or "").strip()
+                    os.path.normcase(os.path.normpath(str((item or {}).get("path") or "").strip()))
+                    if getattr(library, "type", None) == "local"
+                    else str((item or {}).get("path") or "").strip()
                     for item in group_failed
                     if isinstance(item, dict)
                 }
                 failed_paths.extend(group_failed)
-                group_success_paths = [path for path in group["paths"] if path not in failed_lookup]
+                group_success_paths = [
+                    path for path in group["paths"]
+                    if (
+                        os.path.normcase(os.path.normpath(path))
+                        if getattr(library, "type", None) == "local"
+                        else path
+                    ) not in failed_lookup
+                ]
                 success_paths.extend(group_success_paths)
                 success_count += int(result.get("success_count") or len(group_success_paths))
                 if group_success_paths:
-                    _invalidate_rj_subtitle_folder_summary_cache(group["library"].id)
+                    _invalidate_rj_subtitle_folder_summary_cache(library.id)
+                    if prepared is not None and getattr(library, "type", None) == "local":
+                        effects = planned_effects_by_library.get(library.id, [])
+                        successful_keys = {
+                            os.path.normcase(os.path.normpath(path))
+                            for path in group_success_paths
+                        }
+                        actual_effects_by_library[library.id] = [
+                            effect for effect, path in zip(effects, group["paths"])
+                            if os.path.normcase(os.path.normpath(path)) in successful_keys
+                        ]
             except Exception as e:
-                logger.error(f"批量删除失败：library={group['library'].id}, {e}", exc_info=True)
+                logger.error(f"批量删除失败：library={library.id}, {e}", exc_info=True)
                 failed_paths.extend({"path": path, "error": str(e)} for path in group["paths"])
 
-        return {
+        response = {
             "message": "批量删除完成",
             "success_count": success_count,
             "success_paths": success_paths,
             "failed_paths": failed_paths,
             "index_mutation_queued": success_count > 0,
         }
+        if prepared is not None:
+            try:
+                response = mutation_service.finalize(
+                    prepared.operation_id,
+                    actual_effects_by_library=actual_effects_by_library,
+                    actual_result=response,
+                )
+            except Exception as exc:
+                mutation_service.mark_reconcile_required(prepared.operation_id, exc)
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        **response,
+                        "operation_id": prepared.operation_id,
+                        "operation_state": "reconcile_required",
+                        "reconciliation_pending": True,
+                    },
+                )
+        return response
         
     except HTTPException:
         raise

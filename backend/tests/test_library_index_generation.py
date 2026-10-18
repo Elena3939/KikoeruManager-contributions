@@ -20,6 +20,7 @@ from app.models.database import (
     LibraryIndexMutationLedger,
     LibraryIndexMutationOperation,
     LibraryIndexPendingMask,
+    LibraryIndexRJEntry,
     LibraryIndexStatus,
     get_local_now,
 )
@@ -332,6 +333,89 @@ def _add_index_entry(
         db.commit()
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("scope,mask_path", [
+    ("exact", "circle/RJ01570953"),
+    ("subtree", "circle"),
+    ("subtree", ""),
+])
+def test_rj_index_survives_refresh_under_pending_mask(generation_env, scope, mask_path):
+    env = generation_env
+    library_id = "masked-rj-library"
+    path = "circle/RJ01570953"
+    _seed_active(env, library_id)
+    _add_index_entry(
+        env, library_id=library_id, generation=1,
+        relative_path=path, rjcode="RJ01570953",
+    )
+    with env.Session() as db:
+        env.store._sync_rj_entries_in_session(db, library_id, 1)
+        db.add(LibraryIndexMutationOperation(
+            operation_id="masked-rj-op", idempotency_key="masked-rj-key",
+            request_fingerprint="masked-rj-fingerprint", kind="reconcile",
+            state="committed", planned_scopes=[], actual_result={},
+        ))
+        db.flush()
+        db.add(LibraryIndexPendingMask(
+            operation_id="masked-rj-op", library_id=library_id,
+            effect_no=0, ledger_seq=1, kind="reconcile",
+            relative_path=mask_path, scope=scope,
+        ))
+        db.commit()
+
+    assert env.service.find_by_rjcode("RJ01570953", library_id) == []
+    assert env.service.find_by_rjcodes(["RJ01570953"], library_id) == []
+    with env.Session() as db:
+        env.store._refresh_derived_paths_in_session(
+            db, {(library_id, 1): {path}},
+            materialized_seq_by_library={library_id: 0},
+        )
+        db.commit()
+        assert db.query(LibraryIndexRJEntry).filter_by(
+            library_id=library_id, generation=1, rjcode="RJ01570953",
+        ).count() == 1
+        db.query(LibraryIndexPendingMask).filter_by(
+            operation_id="masked-rj-op",
+        ).delete(synchronize_session=False)
+        db.commit()
+
+    assert [row.relative_path for row in env.service.find_by_rjcode(
+        "RJ01570953", library_id,
+    )] == [path]
+    assert [row.relative_path for row in env.service.find_by_rjcodes(
+        ["RJ01570953"], library_id,
+    )] == [path]
+
+
+def test_building_rj_index_survives_mask_removed_at_cutover(generation_env):
+    env = generation_env
+    library_id = "building-rj-library"
+    path = "RJ01570953"
+    _seed_active(env, library_id)
+    (env.root / path).mkdir()
+    generation, base_seq = env.service._create_building_generation(library_id, str(env.root))
+    with env.Session() as db:
+        db.add(LibraryIndexMutationOperation(
+            operation_id="building-rj-op", idempotency_key="building-rj-key",
+            request_fingerprint="building-rj-fingerprint", kind="reconcile",
+            state="committed", planned_scopes=[], actual_result={},
+        ))
+        db.flush()
+        db.add(LibraryIndexPendingMask(
+            operation_id="building-rj-op", library_id=library_id,
+            effect_no=0, ledger_seq=base_seq, kind="reconcile",
+            relative_path=path, scope="subtree",
+        ))
+        db.commit()
+    stats = env.service._scan_building_generation(
+        library_id, str(env.root), generation, base_seq, 2,
+    )
+    assert env.service.find_by_rjcodes(["RJ01570953"], library_id) == []
+    env.service._cutover_building_generation(library_id, generation, base_seq, stats)
+    hits = env.service.find_by_rjcodes(["RJ01570953"], library_id)
+    assert [row.relative_path for row in hits] == [path]
+    assert hits[0].generation == generation
 
 
 def test_find_by_rjcode_repairs_legacy_row_and_bumps_view_revision(generation_env):
