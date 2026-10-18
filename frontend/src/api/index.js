@@ -2942,8 +2942,8 @@ export const kikoeruDbApi = {
     return response.data
   },
 
-  restoreBackup: async (filename) => {
-    const response = await apiClient.post('/kikoeru-db/backup/restore', { filename })
+  restoreBackup: async (filename, confirm = false) => {
+    const response = await apiClient.post('/kikoeru-db/backup/restore', { filename, confirm })
     return response.data
   },
 

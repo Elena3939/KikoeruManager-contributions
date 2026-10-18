@@ -208,10 +208,11 @@ async def create_backup(body: Dict[str, Any] = Body(default={})):
 async def restore_backup(body: Dict[str, Any] = Body(...)):
     _require_enabled()
     filename = str((body or {}).get("filename") or "")
+    confirm = bool((body or {}).get("confirm"))
     import asyncio
 
     try:
-        result = await asyncio.to_thread(_service().restore_backup, filename)
+        result = await asyncio.to_thread(_service().restore_backup, filename, confirm)
         return result
     except KikoeruDbError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc))

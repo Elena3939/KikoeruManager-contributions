@@ -87,6 +87,7 @@
               <span class="inline-flex items-center gap-1.5">
                 {{ t.name }}
                 <el-tag v-if="t.mode === 'readonly'" size="small" type="warning" effect="plain">只读</el-tag>
+                <el-tag v-if="t.known === false" size="small" type="info" effect="plain">未识别</el-tag>
               </span>
             </template>
           </el-tab-pane>
@@ -1091,9 +1092,12 @@ async function saveRow() {
 
 async function deleteSelected() {
   if (selectedRows.value.length === 0) return
+  const cacheHint = activeTable.value === 't_work'
+    ? ' 注意：Kikoeru 音频缓存按作品归档且不再自动淘汰，删除作品不会清理已缓存文件。'
+    : ''
   try {
     await ElMessageBox.confirm(
-      `确定删除选中的 ${selectedRows.value.length} 行？删除前会自动生成回滚快照。`,
+      `确定删除选中的 ${selectedRows.value.length} 行？删除前会自动生成回滚快照。${cacheHint}`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
     )
@@ -1102,19 +1106,26 @@ async function deleteSelected() {
   }
   const pkCols = columns.value.filter(c => c.pk)
   let ok = 0
+  let relatedTracks = 0
+  let cacheNote = ''
   for (const row of selectedRows.value) {
     try {
       const id = pkCols.length > 1
         ? Object.fromEntries(pkCols.map(c => [c.name, row[c.name]]))
         : row[pkCols[0]?.name || 'rowid']
-      await kikoeruDbApi.deleteRow(activeTable.value, id)
+      const result = await kikoeruDbApi.deleteRow(activeTable.value, id)
       ok += 1
+      relatedTracks += Number(result?.related_tracks || 0)
+      if (result?.cache_note) cacheNote = result.cache_note
     } catch (error) {
       ElMessage.error(apiErrorDetail(error, `删除行失败: ${JSON.stringify(row).slice(0, 60)}`))
     }
   }
   if (ok > 0) {
-    ElMessage.success(`已删除 ${ok} 行`)
+    let message = `已删除 ${ok} 行`
+    if (relatedTracks > 0) message += `；关联 t_track 轨道 ${relatedTracks} 条`
+    ElMessage.success(message)
+    if (cacheNote) ElMessage.warning(cacheNote)
     await loadRows()
     await loadBackups()
   }
@@ -1152,7 +1163,22 @@ async function doRestore() {
   }
   restoring.value = true
   try {
-    await kikoeruDbApi.restoreBackup(restoreSelection.value.filename)
+    try {
+      await kikoeruDbApi.restoreBackup(restoreSelection.value.filename)
+    } catch (error) {
+      if (error?.response?.status !== 409) throw error
+      // 跨版本护栏：备份缺少当前库已有的表（如新版 t_track），需二次确认
+      try {
+        await ElMessageBox.confirm(
+          `${error.response?.data?.detail || '该备份缺少当前库已有的表。'} 继续恢复会回退到旧结构，相关历史数据需要 Kikoeru 重新扫描重建。`,
+          '跨版本恢复确认',
+          { type: 'warning', confirmButtonText: '仍然恢复', cancelButtonText: '取消' }
+        )
+      } catch {
+        return
+      }
+      await kikoeruDbApi.restoreBackup(restoreSelection.value.filename, true)
+    }
     ElMessage.success('恢复完成')
     restoreDialogVisible.value = false
     await Promise.all([loadBackups(), loadRows()])

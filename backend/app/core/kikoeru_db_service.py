@@ -15,6 +15,7 @@
 
 编码约定：方法内需要配置时显式 ``config = get_config()``。
 """
+import gzip
 import logging
 import json
 import os
@@ -33,9 +34,15 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- 表权限白名单
 TABLE_EDITABLE = {"t_work", "t_circle", "t_tag", "t_va", "r_tag_work", "r_va_work", "t_review"}
-TABLE_READONLY = {"t_play_histroy", "t_translate_task"}
+# t_track：Kikoeru 0.6.18 新增的逐音频文件轨道表。只读浏览，禁止直写
+# （hash/时长由 Kikoeru 自己维护，外部改写会破坏其缓存与总时长汇总）。
+TABLE_READONLY = {"t_play_histroy", "t_translate_task", "t_track"}
 TABLE_HIDDEN = {"t_user", "knex_migrations"}
-TABLE_EXPECTED = TABLE_EDITABLE | TABLE_READONLY | TABLE_HIDDEN  # 共 11 张
+# 已知的「可选表」：新版库有、旧版库没有，因此不参与必需表缺失判定。
+TABLE_KNOWN_OPTIONAL = {"t_track"}
+# 必需表 11 张（不含可选表）；旧版/新版库都应齐备。
+TABLE_EXPECTED = (TABLE_EDITABLE | TABLE_READONLY | TABLE_HIDDEN) - TABLE_KNOWN_OPTIONAL
+TABLE_KNOWN = TABLE_EXPECTED | TABLE_KNOWN_OPTIONAL
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
@@ -103,8 +110,9 @@ class KikoeruDbService:
             raise KikoeruDbError(f"非法表名: {table!r}", 400)
         if name in TABLE_HIDDEN:
             raise KikoeruDbError("该表受保护，不可访问", 403)
-        if name not in TABLE_EDITABLE and name not in TABLE_READONLY:
-            raise KikoeruDbError(f"未知表: {name}", 404)
+        if name.lower().startswith("sqlite_"):
+            raise KikoeruDbError("SQLite 内部表不可访问", 403)
+        # 未登记的新表（Kikoeru 升级新增）允许只读访问；写入仍只放行白名单。
         if need in ("write",) and name not in TABLE_EDITABLE:
             raise KikoeruDbError(f"表 {name} 为只读表，不可修改", 403)
         return name
@@ -115,7 +123,10 @@ class KikoeruDbService:
             return "editable"
         if table in TABLE_READONLY:
             return "readonly"
-        return "hidden"
+        if table in TABLE_HIDDEN:
+            return "hidden"
+        # 未知表按只读暴露，避免新版新增表在页面上整表消失。
+        return "readonly"
 
     # ------------------------------------------------------------------ 连接
     @staticmethod
@@ -181,6 +192,23 @@ class KikoeruDbService:
                     dst.close()
             finally:
                 src.close()
+            # snapshot 是内部回滚用的高频备份（每次写事务前一份）。t_track 让库
+            # 体积翻倍后，未压缩快照会迅速吃满磁盘，这里落盘后立即 gzip。
+            # 压缩失败则保留原始 .sqlite3（功能优先于体积）。
+            final_path = target
+            if kind == "snapshot":
+                gz_path = target.parent / f"{target.name}.gz"
+                try:
+                    with open(target, "rb") as raw, gzip.open(gz_path, "wb", compresslevel=6) as gz:
+                        shutil.copyfileobj(raw, gz, length=1024 * 1024)
+                    target.unlink()
+                    final_path = gz_path
+                except OSError:
+                    logger.warning("[KIKOERU-DB] snapshot 压缩失败，保留未压缩快照: %s", target, exc_info=True)
+                    try:
+                        gz_path.unlink()
+                    except OSError:
+                        pass
             # activate 原始备份只保留 1 份：删除更早的 activate
             if kind == "activate":
                 for old in sorted(backup_dir.glob(f"{db_path.stem}_*_activate.sqlite3"))[:-1]:
@@ -188,17 +216,17 @@ class KikoeruDbService:
                         old.unlink()
                     except OSError:
                         logger.warning("[KIKOERU-DB] 清理旧 activate 备份失败: %s", old)
-            logger.info("[KIKOERU-DB] 备份完成 kind=%s -> %s", kind, target)
-            return {"filename": target.name, "kind": kind, "size": target.stat().st_size,
-                    "created_at": datetime.fromtimestamp(target.stat().st_mtime).isoformat(timespec="seconds")}
+            logger.info("[KIKOERU-DB] 备份完成 kind=%s -> %s", kind, final_path)
+            return {"filename": final_path.name, "kind": kind, "size": final_path.stat().st_size,
+                    "created_at": datetime.fromtimestamp(final_path.stat().st_mtime).isoformat(timespec="seconds")}
 
     @staticmethod
     def list_backups(kind: Optional[str] = None) -> List[Dict[str, Any]]:
         backup_dir = KikoeruDbService._resolve_backup_dir()
         db_stem = KikoeruDbService._resolve_db_path().stem
         items: List[Dict[str, Any]] = []
-        for f in backup_dir.glob("*.sqlite3"):
-            m = re.match(rf"^{re.escape(db_stem)}_\d{{8}}_\d{{6}}_([a-z\-]+)\.sqlite3$", f.name)
+        for f in backup_dir.glob("*.sqlite3*"):
+            m = re.match(rf"^{re.escape(db_stem)}_\d{{8}}_\d{{6}}_([a-z\-]+)\.sqlite3(?:\.gz)?$", f.name)
             if not m:
                 continue
             file_kind = m.group(1)
@@ -232,7 +260,7 @@ class KikoeruDbService:
         now_ts = datetime.now().timestamp()
         max_keep = max(int(config.kikoeru_db.snapshot_retention or 20), 1)
         snaps = sorted(
-            [f for f in backup_dir.glob(f"{db_stem}_*_snapshot.sqlite3")],
+            [f for f in backup_dir.glob(f"{db_stem}_*_snapshot.sqlite3*")],
             key=lambda f: f.stat().st_mtime, reverse=True,
         )
         for idx, old in enumerate(snaps):
@@ -246,53 +274,109 @@ class KikoeruDbService:
         return removed
 
     @staticmethod
-    def restore_backup(filename: str) -> Dict[str, Any]:
-        """用指定备份整文件替换当前库。恢复前自动做 pre-restore 备份。"""
+    def _table_names(path: Path) -> set:
+        """读取库内用户表名集合（排除 sqlite 内部表）。"""
+        conn = sqlite3.connect(str(path))
+        try:
+            return {
+                str(r[0]) for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+    @staticmethod
+    def restore_backup(filename: str, confirm: bool = False) -> Dict[str, Any]:
+        """用指定备份整文件替换当前库。恢复前自动做 pre-restore 备份。
+
+        - 支持普通 .sqlite3 与 snapshot 的 .sqlite3.gz；
+        - 跨版本护栏：备份缺少当前库已有的表（例如新版 t_track）时默认拒绝，
+          必须由调用方显式 confirm=True 才继续，避免误把新库恢复成旧结构。
+        """
         with _DB_OP_LOCK:
             backup_dir = KikoeruDbService._resolve_backup_dir()
             db_path = KikoeruDbService._resolve_db_path()
 
             safe_name = Path(str(filename or "")).name
-            if not re.match(rf"^{re.escape(db_path.stem)}_\d{{8}}_\d{{6}}_[a-z\-]+\.sqlite3$", safe_name):
+            if not re.match(rf"^{re.escape(db_path.stem)}_\d{{8}}_\d{{6}}_[a-z\-]+\.sqlite3(?:\.gz)?$", safe_name):
                 raise KikoeruDbError(f"非法备份文件名: {filename}", 400)
             source = backup_dir / safe_name
             if not source.is_file():
                 raise KikoeruDbError(f"备份文件不存在: {safe_name}", 404)
 
-            # 恢复前先备份当前状态
-            KikoeruDbService.create_backup("pre-restore")
-
-            # 校验备份文件本身可用
-            check = sqlite3.connect(str(source))
-            try:
-                result = check.execute("PRAGMA integrity_check").fetchone()
-                if not result or str(result[0]).lower() != "ok":
-                    raise KikoeruDbError(f"备份文件损坏（integrity_check={result[0] if result else 'n/a'}），已中止恢复", 500)
-            finally:
-                check.close()
-
-            # 写入临时文件后原子替换；一并清掉旧 -wal/-shm，防止旧 WAL 污染新主库
-            tmp = db_path.with_suffix(".sqlite3.restore_tmp")
-            shutil.copy2(source, tmp)
-            os.replace(tmp, db_path)
-            for suffix in ("-wal", "-shm"):
-                stale = Path(str(db_path) + suffix)
+            # snapshot 是 gzip 存储，恢复前先解到临时文件
+            extract_path: Optional[Path] = None
+            check_path = source
+            if safe_name.endswith(".gz"):
+                extract_path = backup_dir / f".restore_extract_{datetime.now().strftime('%Y%m%d_%H%M%S%f')}.sqlite3"
                 try:
-                    if stale.exists():
-                        stale.unlink()
-                except OSError:
-                    logger.warning("[KIKOERU-DB] 清理旧 %s 失败（建议确认 Kikoeru 状态）", stale.name)
+                    with gzip.open(source, "rb") as src_gz, open(extract_path, "wb") as raw:
+                        shutil.copyfileobj(src_gz, raw, length=1024 * 1024)
+                except (OSError, EOFError) as exc:
+                    try:
+                        extract_path.unlink()
+                    except OSError:
+                        pass
+                    raise KikoeruDbError(f"备份压缩包解压失败，已中止恢复: {exc}", 500) from exc
+                check_path = extract_path
 
-            verify = KikoeruDbService._connect(readonly=True)
             try:
-                row = verify.execute("PRAGMA integrity_check").fetchone()
-                ok = bool(row) and str(row[0]).lower() == "ok"
+                # 校验备份文件本身可用
+                check = sqlite3.connect(str(check_path))
+                try:
+                    result = check.execute("PRAGMA integrity_check").fetchone()
+                    if not result or str(result[0]).lower() != "ok":
+                        raise KikoeruDbError(
+                            f"备份文件损坏（integrity_check={result[0] if result else 'n/a'}），已中止恢复", 500
+                        )
+                finally:
+                    check.close()
+
+                # 跨版本护栏：备份少表说明会回退结构（如 t_track），默认拒绝
+                dropped_tables = sorted(
+                    KikoeruDbService._table_names(db_path) - KikoeruDbService._table_names(check_path)
+                )
+                if dropped_tables and not confirm:
+                    raise KikoeruDbError(
+                        "该备份缺少当前库已有的表: "
+                        f"{', '.join(dropped_tables)}。恢复后这些表的数据会回退"
+                        "（Kikoeru 重启可能重建空表，但历史数据需要重新扫描）。"
+                        "确认继续请携带 confirm=true 重试。",
+                        409,
+                    )
+
+                # 校验通过后再拍 pre-restore，避免失败时留下无用备份
+                KikoeruDbService.create_backup("pre-restore")
+
+                # 写入临时文件后原子替换；一并清掉旧 -wal/-shm，防止旧 WAL 污染新主库
+                tmp = db_path.with_suffix(".sqlite3.restore_tmp")
+                shutil.copy2(check_path, tmp)
+                os.replace(tmp, db_path)
+                for suffix in ("-wal", "-shm"):
+                    stale = Path(str(db_path) + suffix)
+                    try:
+                        if stale.exists():
+                            stale.unlink()
+                    except OSError:
+                        logger.warning("[KIKOERU-DB] 清理旧 %s 失败（建议确认 Kikoeru 状态）", stale.name)
+
+                verify = KikoeruDbService._connect(readonly=True)
+                try:
+                    row = verify.execute("PRAGMA integrity_check").fetchone()
+                    ok = bool(row) and str(row[0]).lower() == "ok"
+                finally:
+                    verify.close()
+                if not ok:
+                    raise KikoeruDbError("恢复后 integrity_check 未通过", 500)
+                logger.info("[KIKOERU-DB] 恢复完成: %s -> %s", safe_name, db_path)
+                return {"restored": safe_name, "integrity": "ok", "dropped_tables": dropped_tables}
             finally:
-                verify.close()
-            if not ok:
-                raise KikoeruDbError("恢复后 integrity_check 未通过", 500)
-            logger.info("[KIKOERU-DB] 恢复完成: %s -> %s", safe_name, db_path)
-            return {"restored": safe_name, "integrity": "ok"}
+                if extract_path is not None:
+                    try:
+                        extract_path.unlink()
+                    except OSError:
+                        pass
 
     # ------------------------------------------------------------------ 只读查询
     def query_table(self, table: str, page: int = 1, size: int = 50,
@@ -342,6 +426,10 @@ class KikoeruDbService:
                 "page": page,
                 "size": size,
             }
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                raise KikoeruDbError(f"表不存在: {table}", 404) from exc
+            raise
         finally:
             conn.close()
 
@@ -358,7 +446,7 @@ class KikoeruDbService:
             mode = self._table_mode(name)
             if mode == "hidden":
                 continue
-            result.append({"name": name, "mode": mode})
+            result.append({"name": name, "mode": mode, "known": name in TABLE_KNOWN})
         return result
 
     # ------------------------------------------------------------------ 写事务（UNC/本地直写，写前快照）
@@ -482,15 +570,69 @@ class KikoeruDbService:
 
         return self._write_with_snapshot(_do)
 
+    @staticmethod
+    def _inspect_track_dependents(conn: sqlite3.Connection, work_id: Any) -> tuple:
+        """检查 t_track 中挂在指定作品下的轨道行（旧版库无此表时返回 0）。
+
+        返回 ``(轨道行数, 外键 on_delete 动作)``；on_delete 为 None 表示未声明外键，
+        只能提示可能出现孤儿行，不能据此阻断删除。
+        """
+        try:
+            cols = {c["name"] for c in KikoeruDbService._columns_of(conn, "t_track")}
+        except sqlite3.Error:
+            return 0, None
+        if not cols:
+            return 0, None
+
+        from_col: Optional[str] = None
+        on_delete: Optional[str] = None
+        try:
+            fk_rows = conn.execute('PRAGMA foreign_key_list("t_track")').fetchall()
+        except sqlite3.Error:
+            fk_rows = []
+        for fk in fk_rows:
+            if str(fk["table"] or "").lower() == "t_work":
+                from_col = str(fk["from"] or "")
+                on_delete = str(fk["on_delete"] or "").upper()
+                break
+        if not from_col:
+            from_col = next((c for c in ("work_id", "workId", "t_work_id") if c in cols), None)
+        if not from_col:
+            return 0, None
+
+        try:
+            row = conn.execute(
+                f'SELECT COUNT(*) AS n FROM "t_track" WHERE "{from_col}" = ?', (work_id,)
+            ).fetchone()
+        except sqlite3.Error:
+            return 0, None
+        return int(row["n"] if row else 0), on_delete
+
     def delete_row(self, table: str, row_id: Any) -> Dict[str, Any]:
         table = self._validate_table(table, need="write")
 
         def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
             where, values = self._pk_where(conn, table, row_id)
+            related_tracks = 0
+            track_on_delete: Optional[str] = None
+            if table == "t_work" and not isinstance(row_id, dict):
+                related_tracks, track_on_delete = self._inspect_track_dependents(conn, row_id)
+                # 外键明确且不具备级联能力时，删除必然失败：提前给出可读错误
+                if related_tracks and track_on_delete not in ("CASCADE", "SET NULL", "SET DEFAULT"):
+                    raise KikoeruDbError(
+                        f"该作品仍有 {related_tracks} 条 t_track 轨道记录（外键 on_delete={track_on_delete or '未声明'}），"
+                        "请先清理轨道记录后再删除。",
+                        409,
+                    )
             cur = conn.execute(f'DELETE FROM "{table}" WHERE {where}', values)
             if cur.rowcount == 0:
                 raise KikoeruDbError("未找到目标行", 404)
-            return {"table": table, "deleted": cur.rowcount}
+            result: Dict[str, Any] = {"table": table, "deleted": cur.rowcount}
+            if table == "t_work":
+                result["related_tracks"] = related_tracks
+                result["track_on_delete"] = track_on_delete
+                result["cache_note"] = "Kikoeru 音频缓存按作品归档且不再自动淘汰，删除作品不会清理已缓存文件。"
+            return result
 
         return self._write_with_snapshot(_do)
 
@@ -592,6 +734,7 @@ class KikoeruDbService:
     def diagnose(self) -> Dict[str, Any]:
         """四步检测：路径可达 → 结构+完整性 → 锁可用 → 副本试写。"""
         steps: List[Dict[str, Any]] = []
+        table_report: Dict[str, Any] = {}
 
         def _step(name: str, ok: bool, detail: str) -> None:
             steps.append({"step": name, "ok": ok, "detail": detail})
@@ -617,16 +760,35 @@ class KikoeruDbService:
         try:
             conn = self._connect(db_path, readonly=True)
             try:
-                names = {r["name"] for r in conn.execute(
+                all_names = {r["name"] for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()}
+                names = {n for n in all_names if not str(n).lower().startswith("sqlite_")}
                 missing = sorted(TABLE_EXPECTED - names)
+                known_new = sorted(TABLE_KNOWN_OPTIONAL & names)
+                unknown_new = sorted(names - TABLE_KNOWN)
+                table_report.update({
+                    "required": len(TABLE_EXPECTED),
+                    "total": len(names),
+                    "missing": missing,
+                    "known_new": known_new,
+                    "unknown": unknown_new,
+                })
                 row = conn.execute("PRAGMA integrity_check").fetchone()
                 integrity = str(row[0]).lower() if row else "unknown"
                 if missing:
-                    _step("结构匹配", False, f"缺少表: {missing}（可能为旧版或异常库）")
+                    _step("结构匹配", False, f"缺少必需表: {missing}（可能为旧版或异常库）")
                 else:
-                    _step("结构匹配", True, f"11 张表齐全，integrity_check={integrity}")
+                    extras = []
+                    if known_new:
+                        extras.append(f"新增表 {', '.join(known_new)}")
+                    if unknown_new:
+                        extras.append(f"未识别表 {', '.join(unknown_new)}")
+                    suffix = f"；检测到{'、'.join(extras)}" if extras else ""
+                    _step(
+                        "结构匹配", True,
+                        f"{len(TABLE_EXPECTED)} 张必需表齐全{suffix}，integrity_check={integrity}",
+                    )
             finally:
                 conn.close()
         except Exception as exc:  # noqa: BLE001
@@ -684,7 +846,8 @@ class KikoeruDbService:
             except Exception as exc:  # noqa: BLE001
                 _step("写入能力", False, f"副本试写失败（检查写权限/只读挂载）: {exc}")
 
-        return {"ok": all(s["ok"] for s in steps), "db_path": str(db_path), "steps": steps}
+        return {"ok": all(s["ok"] for s in steps), "db_path": str(db_path),
+                "steps": steps, "tables": table_report}
 
 
 _service: Optional[KikoeruDbService] = None
