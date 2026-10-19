@@ -17,7 +17,7 @@ from typing import Optional, Set, List, Callable
 import logging
 
 from ..config.settings import get_config
-from ..core.archive_detection import has_embedded_zip_archive
+from ..core.archive_detection import detect_embedded_7z_offset, has_embedded_zip_archive
 from ..core.polyglot_detector import find_embedded_archive
 from ..core.task_engine import Task, TaskType, get_task_engine
 from ..core.password_utils import normalize_password_value
@@ -103,6 +103,20 @@ class FileProcessor:
     @staticmethod
     def _has_active_aria2_sidecar(file_path: str) -> bool:
         return os.path.isfile(f"{file_path}.aria2")
+
+    @staticmethod
+    def _has_zip_volume_main(file_path: str) -> bool:
+        """判断 .zNN 是否有对应的 ZIP 主卷。
+
+        没有主卷的 .zNN 不能直接当作 ZIP 分卷跳过，因为下载源可能只是把
+        单体 7z 压缩包伪装成了 .z77 等后缀。
+        """
+        filename = os.path.basename(file_path)
+        match = re.fullmatch(r'(?P<base>.+)\.z\d{2}', filename, re.IGNORECASE)
+        if not match:
+            return False
+        zip_main = os.path.join(os.path.dirname(file_path), f"{match.group('base')}.zip")
+        return os.path.isfile(zip_main)
 
     @staticmethod
     def _inherit_download_password_metadata(file_path: str, engine) -> dict:
@@ -470,10 +484,11 @@ class FileProcessor:
         filename = Path(file_path).name.lower()
         ext = Path(file_path).suffix.lower()
 
-        # 先检查是否是分卷文件后缀，只有真正的主执行文件才创建任务
-        # ZIP 分卷: .z01, .z02, ... .z99，应该由 *.zip 主文件触发处理
+        # 先检查是否是分卷文件后缀，只有真正的主执行文件才创建任务。
+        # .zNN 既可能是 ZIP 分卷，也可能只是把单体 7z 伪装成了 z77 等后缀；
+        # 只有同目录存在对应 .zip 主卷时，才按 ZIP 分卷跳过。
         z_match = re.search(r'\.z(\d{2})$', filename)
-        if z_match:
+        if z_match and self._has_zip_volume_main(file_path):
             logger.debug(f"[FileProcessor] 跳过 ZIP 分卷文件，等待 *.zip 主文件: {filename}")
             return False
 
@@ -541,6 +556,9 @@ class FileProcessor:
                 return True
             if has_embedded_zip_archive(file_path):
                 logger.info(f"[FileProcessor] 检测到带前缀伪装的 ZIP 压缩包: {file_path}")
+                return True
+            if detect_embedded_7z_offset(file_path) is not None:
+                logger.info(f"[FileProcessor] 检测到带前缀伪装的 7z 压缩包: {file_path}")
                 return True
             embedded = find_embedded_archive(file_path)
             if embedded is not None:
@@ -716,7 +734,6 @@ class FileProcessor:
         part_patterns = [
             r'\.part(\d+)\.(rar|zip|7z|exe)$',  # 带扩展名的分卷（含 WinRAR SFX 首卷 .part1.exe）
             r'\.part(\d+)$',                  # 无扩展名的分卷
-            r'\.z\d{2}$',                     # ZIP分卷
             r'\.r\d{2}$',                     # 旧式 RAR 分卷
             r'\.7z\.\d{3}$',                  # 7z 分卷首尾格式
         ]
@@ -726,13 +743,17 @@ class FileProcessor:
             r'^.+\.7z\.001$',
         ]
 
+        is_zip_volume = bool(
+            re.search(r'\.z\d{2}$', basename, re.IGNORECASE)
+            and self._has_zip_volume_main(file_path)
+        )
         is_potential_volume = any(
             re.search(p, basename, re.IGNORECASE)
             for p in part_patterns
         ) or any(
             re.search(p, basename, re.IGNORECASE)
             for p in main_volume_patterns
-        )
+        ) or is_zip_volume
 
         if is_potential_volume:
             logger.debug(f"[FileProcessor] 检测到可能是分卷文件，等待其他分卷: {basename}")
